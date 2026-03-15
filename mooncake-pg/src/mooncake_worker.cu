@@ -271,6 +271,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
         bufferToTensor) {
+    // Sync activeRanks from activeRanksTensor so that Python-side modifications
+    // (e.g. marking peers inactive during elastic EP single-rank recovery) are
+    // respected by the barrier and other collective operations.
+    if (meta->activeRanksTensor.defined()) {
+        auto accessor = meta->activeRanksTensor.accessor<int32_t, 1>();
+        for (int i = 0; i < meta->size; ++i) {
+            meta->activeRanks[i] = (accessor[i] != 0);
+        }
+    }
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
