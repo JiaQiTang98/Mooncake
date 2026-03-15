@@ -843,4 +843,13 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
                           std::to_string(meta_->taskCount));
     }
 }
+
+void MooncakeBackend::setActiveRanks(const at::Tensor& activeRanks) {
+    TORCH_CHECK(activeRanks.dtype() == at::kInt, "activeRanks must be int32.");
+    TORCH_CHECK(activeRanks.device().is_cpu(), "activeRanks must be on CPU.");
+    auto accessor = activeRanks.accessor<int32_t, 1>();
+    for (int i = 0; i < meta_->size; ++i) {
+        meta_->activeRanks[i] = (accessor[i] != 0);
+    }
+}
 }  // namespace mooncake

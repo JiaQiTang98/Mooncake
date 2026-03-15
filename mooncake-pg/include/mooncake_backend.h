@@ -150,6 +150,8 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     void recoverRanks(const std::vector<int>& ranks);
 
+    void setActiveRanks(const at::Tensor& activeRanks);
+
    private:
     static TransferEngine* engine_;
     static MooncakeWorker* worker_;
