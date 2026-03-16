@@ -421,8 +421,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
         if (env_value == "false" || env_value == "0" || env_value == "no" ||
             env_value == "off") {
             memcpy_enabled_ = false;
-        } else if (env_value == "true" || env_value == "1" || env_value == "yes" ||
-                   env_value == "on") {
+        } else if (env_value == "true" || env_value == "1" ||
+                   env_value == "yes" || env_value == "on") {
             memcpy_enabled_ = true;
         } else {
             LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_value

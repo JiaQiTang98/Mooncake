@@ -23,7 +23,7 @@
 
 namespace mooncake {
 void loadGlobalConfig(GlobalConfig &config) {
-    auto& env = Environ::Get();
+    auto &env = Environ::Get();
 
     int num_cq_per_ctx = env.GetNumCqPerCtx();
     if (num_cq_per_ctx > 0 && num_cq_per_ctx < 256)
@@ -34,16 +34,14 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.num_comp_channels_per_ctx = num_comp_channels_per_ctx;
 
     int port = env.GetIbPort();
-    if (port >= 0 && port < 256)
-        config.port = uint8_t(port);
+    if (port >= 0 && port < 256) config.port = uint8_t(port);
 
     int gid_index = env.GetGidIndex();
     if (gid_index == 0) {
         const char *nccl_gid = std::getenv("NCCL_IB_GID_INDEX");
         if (nccl_gid) gid_index = atoi(nccl_gid);
     }
-    if (gid_index >= 0 && gid_index < 256)
-        config.gid_index = gid_index;
+    if (gid_index >= 0 && gid_index < 256) config.gid_index = gid_index;
 
     int max_cqe_per_ctx = env.GetMaxCqePerCtx();
     if (max_cqe_per_ctx > 0 && max_cqe_per_ctx <= UINT16_MAX)
@@ -58,12 +56,10 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.num_qp_per_ep = num_qp_per_ep;
 
     int max_sge = env.GetMaxSge();
-    if (max_sge > 0 && max_sge <= UINT16_MAX)
-        config.max_sge = max_sge;
+    if (max_sge > 0 && max_sge <= UINT16_MAX) config.max_sge = max_sge;
 
     int max_wr = env.GetMaxWr();
-    if (max_wr > 0 && max_wr <= UINT16_MAX)
-        config.max_wr = max_wr;
+    if (max_wr > 0 && max_wr <= UINT16_MAX) config.max_wr = max_wr;
 
     int max_inline = env.GetMaxInline();
     if (max_inline >= 0 && max_inline <= UINT16_MAX)
@@ -93,8 +89,7 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.workers_per_ctx = workers_per_ctx;
 
     size_t slice_size = env.GetSliceSize();
-    if (slice_size > 0)
-        config.slice_size = slice_size;
+    if (slice_size > 0) config.slice_size = slice_size;
 
     size_t min_reg_size = env.GetMinRegSize();
     if (min_reg_size > 0) {
@@ -103,8 +98,7 @@ void loadGlobalConfig(GlobalConfig &config) {
     }
 
     int retry_cnt = env.GetRetryCnt();
-    if (retry_cnt > 0 && retry_cnt < 128)
-        config.retry_cnt = retry_cnt;
+    if (retry_cnt > 0 && retry_cnt < 128) config.retry_cnt = retry_cnt;
 
     if (env.GetDisableMetacache()) {
         config.metacache = false;
@@ -197,9 +191,8 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (ib_tc >= 0 && ib_tc <= 255) {
         config.ib_traffic_class = ib_tc;
     } else if (ib_tc < -1) {
-        LOG(WARNING)
-            << "Ignore value from environment variable MC_IB_TC, "
-            << "value out of range (should be 0-255)";
+        LOG(WARNING) << "Ignore value from environment variable MC_IB_TC, "
+                     << "value out of range (should be 0-255)";
     }
 
     int ib_pci_relaxed_ordering = env.GetIbPciRelaxedOrdering();

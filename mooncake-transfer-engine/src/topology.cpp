@@ -336,9 +336,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 
 #endif  // USE_CUDA
 
-Topology::Topology() {
-    use_round_robin_ = Environ::Get().GetPathRoundrobin();
-}
+Topology::Topology() { use_round_robin_ = Environ::Get().GetPathRoundrobin(); }
 
 Topology::~Topology() {}
 

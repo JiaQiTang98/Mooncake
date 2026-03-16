@@ -543,7 +543,7 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 
 #ifdef USE_REDIS
     if (parsed_conn_string.first == "redis") {
-        auto& env = Environ::Get();
+        auto &env = Environ::Get();
         std::string password_str = env.GetRedisPassword();
 
         uint8_t db_index = 0;

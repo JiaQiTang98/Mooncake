@@ -109,8 +109,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
     auto& env = Environ::Get();
-    if (env.GetLegacyRpcPortBinding() ||
-        metadata_conn_string == P2PHANDSHAKE) {
+    if (env.GetLegacyRpcPortBinding() || metadata_conn_string == P2PHANDSHAKE) {
         rpc_binding_method = "legacy/P2P";
         desc.ip_or_host_name = host_name;
         desc.rpc_port = port;
@@ -234,8 +233,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             if (!topo_json.empty()) {
                 local_topology_->parse(topo_json);
             } else {
-                LOG(WARNING) << "Failed to load custom topology from " << custom_topo_json
-                             << ", falling back to auto-detect.";
+                LOG(WARNING)
+                    << "Failed to load custom topology from "
+                    << custom_topo_json << ", falling back to auto-detect.";
                 local_topology_->discover(filter_);
             }
         } else {
@@ -283,8 +283,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 
 #else
-        if (local_topology_->getHcaList().size() > 0 &&
-                !env.GetForceTcp() ||
+        if (local_topology_->getHcaList().size() > 0 && !env.GetForceTcp() ||
             env.GetForceHca()) {
             // only install RDMA transport when there is at least one HCA
             Transport* rdma_transport = nullptr;
