@@ -23,7 +23,7 @@ auto CentralizedClientManager::MountLocalDiskSegment(const UUID& client_id,
     }
 
     auto centralized_meta =
-        std::dynamic_pointer_cast<CentralizedClientMeta>(client_meta);
+        std::static_pointer_cast<CentralizedClientMeta>(client_meta);
     if (!centralized_meta) {
         LOG(ERROR) << "MountLocalDiskSegment: client meta type mismatch";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -49,7 +49,7 @@ auto CentralizedClientManager::OffloadObjectHeartbeat(const UUID& client_id,
     }
 
     auto centralized_meta =
-        std::dynamic_pointer_cast<CentralizedClientMeta>(client_meta);
+        std::static_pointer_cast<CentralizedClientMeta>(client_meta);
     if (!centralized_meta) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -73,7 +73,7 @@ auto CentralizedClientManager::PushOffloadingQueue(
         auto query_res = meta->QuerySegments(segment_name);
         if (query_res.has_value()) {
             auto centralized_meta =
-                std::dynamic_pointer_cast<CentralizedClientMeta>(meta);
+                std::static_pointer_cast<CentralizedClientMeta>(meta);
             if (centralized_meta) {
                 auto ret = centralized_meta->PushOffloadingQueue(key, size,
                                                                  segment_name);
@@ -98,7 +98,7 @@ std::shared_ptr<ClientMeta> CentralizedClientManager::CreateClientMeta(
     auto meta = std::make_shared<CentralizedClientMeta>(req.client_id,
                                                         memory_allocator_type_);
     // Register allocator change callback to sync global_allocator_manager_
-    auto seg_mgr = std::dynamic_pointer_cast<CentralizedSegmentManager>(
+    auto seg_mgr = std::static_pointer_cast<CentralizedSegmentManager>(
         meta->GetSegmentManager());
     if (seg_mgr) {
         seg_mgr->SetAllocatorChangeCallback(

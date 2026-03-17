@@ -56,10 +56,40 @@ Replica::Descriptor Replica::get_descriptor() const {
         } else {
             proxy_desc.segment_id = proxy_data.segment->id;
         }
+        proxy_desc.object_size = proxy_data.object_size;
         desc.descriptor_variant = std::move(proxy_desc);
     }
 
     return desc;
+}
+
+std::ostream& operator<<(std::ostream& os, const Replica::Descriptor& desc) {
+    os << "Descriptor: { status: " << desc.status << ", ";
+    std::visit(
+        [&os](const auto& d) {
+            using T = std::decay_t<decltype(d)>;
+            if constexpr (std::is_same_v<T, MemoryDescriptor>) {
+                os << "type: MEMORY, addr: " << std::hex << "0x"
+                   << d.buffer_descriptor.buffer_address_ << std::dec
+                   << ", size: " << d.buffer_descriptor.size_
+                   << ", endpoint: " << d.buffer_descriptor.transport_endpoint_;
+            } else if constexpr (std::is_same_v<T, DiskDescriptor>) {
+                os << "type: DISK, path: " << d.file_path
+                   << ", size: " << d.object_size;
+            } else if constexpr (std::is_same_v<T, LocalDiskDescriptor>) {
+                os << "type: LOCAL_DISK, client: " << d.client_id
+                   << ", size: " << d.object_size
+                   << ", endpoint: " << d.transport_endpoint;
+            } else if constexpr (std::is_same_v<T, P2PProxyDescriptor>) {
+                os << "type: P2P_PROXY, client: " << d.client_id
+                   << ", segment: " << d.segment_id
+                   << ", endpoint: " << d.ip_address << ":" << d.rpc_port
+                   << ", size: " << d.object_size;
+            }
+        },
+        desc.descriptor_variant);
+    os << " }";
+    return os;
 }
 
 std::ostream& operator<<(std::ostream& os, const Replica& replica) {
@@ -96,6 +126,7 @@ std::ostream& operator<<(std::ostream& os, const Replica& replica) {
                           proxy_data.segment->GetP2PExtra().memory_type);
             }
         }
+        os << ", object_size: " << proxy_data.object_size;
     }
 
     os << " }";

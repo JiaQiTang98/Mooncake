@@ -1,8 +1,8 @@
 #pragma once
 
-#include <algorithm>
 #include <unordered_set>
 #include <vector>
+#include <utility>
 #include "tiered_cache/scheduler/scheduler_policy.h"
 
 namespace mooncake {
@@ -23,7 +23,7 @@ class LRUPolicy : public SchedulerPolicy {
 
     explicit LRUPolicy(Config config) : config_(config) {}
 
-    void SetFastTier(UUID id) { fast_tier_id_ = id; }
+    void SetFastTier(UUID id) override { fast_tier_id_ = id; }
 
     std::vector<SchedAction> Decide(
         const std::unordered_map<UUID, TierStats>& tier_stats,

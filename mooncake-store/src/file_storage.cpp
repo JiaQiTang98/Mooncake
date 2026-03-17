@@ -126,7 +126,7 @@ bool FileStorageConfig::Validate() const {
     return true;
 }
 
-FileStorage::FileStorage(std::shared_ptr<Client> client,
+FileStorage::FileStorage(std::shared_ptr<CentralizedClientService> client,
                          const std::string& local_rpc_addr,
                          const FileStorageConfig& config)
     : client_(client),
@@ -390,7 +390,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
         if (batched_query_results[i]) {
             for (const auto& descriptor :
-                 batched_query_results[i].value().replicas) {
+                 batched_query_results[i].value()->replicas) {
                 if (descriptor.is_memory_replica()) {
                     const auto& memory_descriptor =
                         descriptor.get_memory_descriptor();

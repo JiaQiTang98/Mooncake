@@ -10,6 +10,10 @@ class P2PClientManager final : public ClientManager {
                      const ViewVersionId view_version);
 
    protected:
+    DeploymentMode GetDeploymentMode() const override {
+        return DeploymentMode::P2P;
+    }
+
     std::unique_ptr<ClientIterator> InnerBuildClientIterator(
         ObjectIterateStrategy strategy) override;
     std::shared_ptr<ClientMeta> CreateClientMeta(

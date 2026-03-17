@@ -34,6 +34,10 @@ class CentralizedClientManager final : public ClientManager {
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
    protected:
+    DeploymentMode GetDeploymentMode() const override {
+        return DeploymentMode::CENTRALIZATION;
+    }
+
     std::shared_ptr<ClientMeta> CreateClientMeta(
         const RegisterClientRequest& req) override;
 

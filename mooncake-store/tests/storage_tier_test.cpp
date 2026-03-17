@@ -64,7 +64,7 @@ TEST_F(StorageTierTest, StorageTierBasic) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto init_res = backend.Init(config, nullptr, nullptr);
+    auto init_res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
 
     // Verify tier created
@@ -142,7 +142,7 @@ TEST_F(StorageTierTest, StorageTierBucket) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto init_res = backend.Init(config, nullptr, nullptr);
+    auto init_res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_res.has_value());
 
     // Allocate and Write multiple small items
@@ -314,7 +314,7 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto init_res = backend.Init(config, nullptr, nullptr);
+    auto init_res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_res.has_value());
 
     // Fill up the tier with data (~20KB)

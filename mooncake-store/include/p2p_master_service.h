@@ -34,6 +34,12 @@ class P2PMasterService : public MasterService {
     auto RemoveReplica(const RemoveReplicaRequest& req)
         -> tl::expected<void, ErrorCode>;
 
+    /**
+     * @brief Remove replicas from multiple segments in one call
+     */
+    auto BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
+        -> std::vector<tl::expected<void, ErrorCode>>;
+
     std::vector<Replica::Descriptor> FilterReplicas(
         const GetReplicaListRequestConfig& config,
         const ObjectMetadata& metadata) override;

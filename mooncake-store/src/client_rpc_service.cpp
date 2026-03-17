@@ -44,6 +44,11 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         LOG(ERROR) << "ReadRemoteData failed for key: " << request.key
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
+
+        // Rectify stale route when key not found
+        if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            data_manager_.RectifyReadRoute(request.key);
+        }
         return result;
     }
 

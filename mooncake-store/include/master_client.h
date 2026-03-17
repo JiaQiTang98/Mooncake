@@ -155,12 +155,11 @@ class MasterClient {
 
     /**
      * @brief Register client with the master on startup.
-     * Client calls this to register its UUID and local segments.
-     * @param segments Segments to register
+     * @param req request with registration information
      * @return tl::expected<RegisterClientResponse, ErrorCode>
      */
     [[nodiscard]] tl::expected<RegisterClientResponse, ErrorCode>
-    RegisterClient(const std::vector<Segment>& segments);
+    RegisterClient(const RegisterClientRequest& req);
 
    protected:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr)

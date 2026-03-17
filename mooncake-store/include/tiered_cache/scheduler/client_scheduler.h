@@ -3,6 +3,8 @@
 #include <memory>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <vector>
 #include <unordered_map>
 #include "tiered_cache/scheduler/scheduler_policy.h"
@@ -68,6 +70,10 @@ class ClientScheduler {
     int loop_interval_ms_ = 1000;
     enum class EvictionMode { SYNC, ASYNC };
     EvictionMode eviction_mode_ = EvictionMode::ASYNC;
+
+    // Used to wake the worker thread immediately on Stop().
+    std::mutex cv_mutex_;
+    std::condition_variable cv_;
 };
 
 }  // namespace mooncake

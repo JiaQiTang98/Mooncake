@@ -77,21 +77,22 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(
-        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
-                               FLAGS_protocol, rdma_devices, master_address_),
-        0);
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+        rdma_devices.empty() ? std::nullopt
+                             : std::optional<std::string>(rdma_devices),
+        master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+    ASSERT_EQ(py_client_->setup(config), 0);
 
     const std::string test_data = "Hello, RealClient!";
     const std::string key = "test_key_realclient";
 
     // Test Put operation using span
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig config;
-    config.replica_num = 1;
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
 
-    int put_result = py_client_->put(key, data_span, config);
+    int put_result = py_client_->put(key, data_span, replicate_config);
     EXPECT_EQ(put_result, 0) << "Put operation should succeed";
 
     // Test Get operation using buffer handle
@@ -127,11 +128,12 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(
-        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               512 * 1024 * 1024, 512 * 1024 * 1024,
-                               FLAGS_protocol, rdma_devices, master_address_),
-        0);
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+        rdma_devices.empty() ? std::nullopt
+                             : std::optional<std::string>(rdma_devices),
+        master_address_, 512 * 1024 * 1024, 512 * 1024 * 1024);
+    ASSERT_EQ(py_client_->setup(config), 0);
 
     const size_t data_size = 256 * 1024 * 1024;  // 256MB
     std::string test_data(data_size, 'A');       // Fill with 'A' characters
@@ -248,7 +250,7 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
 TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
-    const size_t segment_size = 16 * 1024 * 1024;
+    const size_t segment_size = 32 * 1024 * 1024;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl_)
                                   .build()))
@@ -259,10 +261,12 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                                     segment_size, segment_size, FLAGS_protocol,
-                                     rdma_devices, master_address_),
-              0);
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+        rdma_devices.empty() ? std::nullopt
+                             : std::optional<std::string>(rdma_devices),
+        master_address_, segment_size, segment_size);
+    ASSERT_EQ(py_client_->setup(config), 0);
 
     // Test Single Get Operation with Concurrent Put
     {
@@ -278,8 +282,8 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
                                   &sync_barrier]() {
                 const int num_iterations = 100;
                 const size_t slice_size =
-                    segment_size / num_threads +
-                    1024;  // Ensure total size larger than segment size
+                    (16 * 1024 * 1024) / num_threads +
+                    1024;  // Ensure total size larger than 16MB
                 const std::string key =
                     "concurrent_test_key_" + std::to_string(thread_idx);
 
@@ -307,7 +311,8 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
                 sync_barrier.arrive_and_wait();
 
                 for (int iter = 0; iter < num_iterations; ++iter) {
-                    py_client_->put(key, data_span, config);
+                    int put_result = py_client_->put(key, data_span, config);
+                    ASSERT_EQ(put_result, 0) << "Put operation should succeed";
 
                     // Randomly choose between get_buffer and get_into
                     if (dis_2(gen) == 0) {
@@ -383,7 +388,7 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
                                   &sync_barrier]() {
                 const int num_slices = 32;
                 const size_t slice_size =
-                    segment_size / (num_threads * num_slices) + 1024;
+                    (16 * 1024 * 1024) / (num_threads * num_slices) + 1024;
                 const size_t data_size = num_slices * slice_size;
                 const int num_iterations = 100;
 
@@ -430,7 +435,10 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
                 sync_barrier.arrive_and_wait();
 
                 for (int iter = 0; iter < num_iterations; ++iter) {
-                    py_client_->put_batch(keys, data_spans, config);
+                    int put_result =
+                        py_client_->put_batch(keys, data_spans, config);
+                    ASSERT_EQ(put_result, 0)
+                        << "Batch put operation should succeed";
 
                     if (dis_2(gen) == 0) {
                         // Test Batch Get operation using batch_get_buffer
@@ -514,21 +522,22 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
     } else {
         ASSERT_TRUE(false) << "Unsupported protocol: " << FLAGS_protocol;
     }
-    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                                     16 * 1024 * 1024, 16 * 1024 * 1024,
-                                     FLAGS_protocol, rdma_devices,
-                                     master_address_, transfer_engine),
-              0);
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+        rdma_devices.empty() ? std::nullopt
+                             : std::optional<std::string>(rdma_devices),
+        master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024, transfer_engine);
+    ASSERT_EQ(py_client_->setup(config), 0);
 
     const std::string test_data = "Hello, RealClient!";
     const std::string key = "test_key_realclient";
 
     // Test Put operation using span
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig config;
-    config.replica_num = 1;
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
 
-    int put_result = py_client_->put(key, data_span, config);
+    int put_result = py_client_->put(key, data_span, replicate_config);
     EXPECT_EQ(put_result, 0) << "Put operation should succeed";
 }
 
@@ -543,11 +552,12 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(
-        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
-                               FLAGS_protocol, rdma_devices, master_address_),
-        0);
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+        rdma_devices.empty() ? std::nullopt
+                             : std::optional<std::string>(rdma_devices),
+        master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+    ASSERT_EQ(py_client_->setup(config), 0);
 
     std::string test_data(1000, '1');
     std::string dst_data(1000, '0');
@@ -585,10 +595,10 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         all_sizes.emplace_back(sizes);
     }
 
-    ReplicateConfig config;
-    config.prefer_alloc_in_same_node = true;
+    ReplicateConfig replicate_config;
+    replicate_config.prefer_alloc_in_same_node = true;
     std::vector<int> results = py_client_->batch_put_from_multi_buffers(
-        keys, all_ptrs, all_sizes, config);
+        keys, all_ptrs, all_sizes, replicate_config);
     for (auto result : results) {
         EXPECT_EQ(result, 0) << "Put operation should succeed";
     }
@@ -619,20 +629,21 @@ TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(
-        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
-                               FLAGS_protocol, rdma_devices, master_address_),
-        0);
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
+        rdma_devices.empty() ? std::nullopt
+                             : std::optional<std::string>(rdma_devices),
+        master_address_, 16 * 1024 * 1024, 16 * 1024 * 1024);
+    ASSERT_EQ(py_client_->setup(config), 0);
 
     const std::string test_data =
         "It's a test data for get_allocated_buffer_desc.";
     const std::string key = "mooncake_key";
     // put test_data with replica_config
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig config;
-    config.replica_num = 1;
-    py_client_->put(key, data_span, config);
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    py_client_->put(key, data_span, replicate_config);
     // test get_replica_desc
     std::vector<Replica::Descriptor> desc = py_client_->get_replica_desc(key);
     EXPECT_EQ(desc.size(), 1) << "get_replica_desc should return 1 desc";

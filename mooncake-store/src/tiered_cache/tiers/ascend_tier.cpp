@@ -374,7 +374,7 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
 
     // Get AscendUnifiedPointer from source using type-safe cast
     const AscendBuffer* ascend_src_buffer =
-        dynamic_cast<const AscendBuffer*>(src.buffer.get());
+        static_cast<const AscendBuffer*>(src.buffer.get());
     if (!ascend_src_buffer) {
         LOG(ERROR) << "CopyAscendToDram: source buffer is not an AscendBuffer";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -442,7 +442,7 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
 
     // Get AscendUnifiedPointer from destination using type-safe cast
     const AscendBuffer* ascend_dst_buffer =
-        dynamic_cast<const AscendBuffer*>(dst.buffer.get());
+        static_cast<const AscendBuffer*>(dst.buffer.get());
     if (!ascend_dst_buffer) {
         LOG(ERROR)
             << "CopyDramToAscend: destination buffer is not an AscendBuffer";

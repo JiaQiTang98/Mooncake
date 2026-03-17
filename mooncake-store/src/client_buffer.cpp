@@ -94,7 +94,9 @@ std::vector<Slice> split_into_slices(BufferHandle& handle) {
 
 uint64_t calculate_total_size(const Replica::Descriptor& replica) {
     uint64_t total_length = 0;
-    if (replica.is_memory_replica() == false) {
+    if (replica.is_p2p_proxy_replica()) {
+        total_length = replica.get_p2p_proxy_descriptor().object_size;
+    } else if (replica.is_memory_replica() == false) {
         auto& disk_descriptor = replica.get_disk_descriptor();
         total_length = disk_descriptor.object_size;
     } else {
@@ -105,7 +107,7 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
 
 int allocateSlices(std::vector<Slice>& slices,
                    const Replica::Descriptor& replica, void* buffer_ptr) {
-    if (replica.is_memory_replica() == false) {
+    if (replica.is_disk_replica()) {
         // For disk-based replica, split into slices based on file size
         uint64_t offset = 0;
         uint64_t total_length = replica.get_disk_descriptor().object_size;
@@ -115,12 +117,18 @@ int allocateSlices(std::vector<Slice>& slices,
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
-    } else {
+    } else if (replica.is_local_disk_replica()) {
+        slices.emplace_back(
+            Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
+    } else if (replica.is_memory_replica()) {
         // For memory-based replica, split into slices based on buffer
         // descriptors
         auto& handle = replica.get_memory_descriptor().buffer_descriptor;
         void* chunk_ptr = buffer_ptr;
         slices.emplace_back(Slice{chunk_ptr, handle.size_});
+    } else if (replica.is_p2p_proxy_replica()) {
+        slices.emplace_back(
+            Slice{buffer_ptr, replica.get_p2p_proxy_descriptor().object_size});
     }
     return 0;
 }

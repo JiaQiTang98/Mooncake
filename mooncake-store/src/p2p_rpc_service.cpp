@@ -17,6 +17,9 @@ void RegisterP2PRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedP2PMasterService::RemoveReplica>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedP2PMasterService::BatchRemoveReplica>(
+        &wrapped_master_service);
 }
 
 tl::expected<WriteRouteResponse, ErrorCode>
@@ -44,6 +47,42 @@ tl::expected<void, ErrorCode> WrappedP2PMasterService::RemoveReplica(
         [&](auto& timer) { timer.LogRequest("key=", req.key); },
         [] { MasterMetricManager::instance().inc_remove_replica_requests(); },
         [] { MasterMetricManager::instance().inc_remove_replica_failures(); });
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedP2PMasterService::BatchRemoveReplica(
+    const BatchRemoveReplicaRequest& req) {
+    ScopedVLogTimer timer(1, "BatchRemoveReplica");
+    const size_t total_requests = req.segment_ids.size();
+    timer.LogRequest("key=", req.key, "segment_count=", total_requests);
+    MasterMetricManager::instance().inc_batch_remove_replica_requests(
+        total_requests);
+
+    auto results = master_service_.BatchRemoveReplica(req);
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            auto error = results[i].error();
+            LOG(ERROR) << "BatchRemoveReplica failed for key '" << req.key
+                       << "', segment_id: " << req.segment_ids[i] << ": "
+                       << toString(error);
+        }
+    }
+
+    if (failure_count == total_requests && total_requests > 0) {
+        MasterMetricManager::instance().inc_batch_remove_replica_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance()
+            .inc_batch_remove_replica_partial_success(failure_count);
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
 }
 
 }  // namespace mooncake

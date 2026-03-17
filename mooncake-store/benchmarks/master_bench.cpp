@@ -106,7 +106,10 @@ class SegmentClient {
                 mooncake::ClientStatus::UNDEFINED &&
             !remount_future_.valid()) {
             remount_future_ = std::async(std::launch::async, [&]() {
-                auto reg_ec = master_client_.RegisterClient({segment_});
+                mooncake::RegisterClientRequest req;
+                req.client_id = client_id_;
+                req.segments = {segment_};
+                auto reg_ec = master_client_.RegisterClient(req);
                 if (!reg_ec.has_value()) {
                     throw std::runtime_error("Failed to register client");
                 }

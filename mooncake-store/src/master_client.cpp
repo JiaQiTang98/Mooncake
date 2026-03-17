@@ -272,14 +272,11 @@ tl::expected<void, ErrorCode> MasterClient::MountSegment(
 }
 
 tl::expected<RegisterClientResponse, ErrorCode> MasterClient::RegisterClient(
-    const std::vector<Segment>& segments) {
+    const RegisterClientRequest& req) {
     ScopedVLogTimer timer(1, "MasterClient::RegisterClient");
     timer.LogRequest("client_id=", client_id_,
-                     ", segments_count=", segments.size());
-
-    RegisterClientRequest req;
-    req.client_id = client_id_;
-    req.segments = segments;
+                     ", segments_count=", req.segments.size(),
+                     ", deployment_mode=", req.deployment_mode);
 
     auto result = invoke_rpc<&WrappedMasterService::RegisterClient,
                              RegisterClientResponse>(req);

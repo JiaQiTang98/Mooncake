@@ -38,6 +38,24 @@ class DataManager {
                 std::shared_ptr<TransferEngine> transfer_engine);
 
     /**
+     * @brief Graceful stop: delegates to TieredBackend::Stop().
+     */
+    void Stop() {
+        if (tiered_backend_) {
+            tiered_backend_->Stop();
+        }
+    }
+
+    /**
+     * @brief Cleanup: delegates to TieredBackend::Destroy().
+     */
+    void Destroy() {
+        if (tiered_backend_) {
+            tiered_backend_->Destroy();
+        }
+    }
+
+    /**
      * @brief Put data locally into tiered storage
      * @param key Object key
      * @param data Source data buffer (takes ownership, zero-copy)
@@ -46,7 +64,7 @@ class DataManager {
      * @return ErrorCode indicating success or failure
      */
     tl::expected<void, ErrorCode> Put(
-        const std::string& key, std::unique_ptr<char[]> data, size_t size,
+        const std::string& key, const Slice& slice,
         std::optional<UUID> tier_id = std::nullopt);
 
     /**
@@ -68,6 +86,11 @@ class DataManager {
      */
     tl::expected<void, ErrorCode> Delete(
         const std::string& key, std::optional<UUID> tier_id = std::nullopt);
+
+    /**
+     * @brief Get tier views from underlying tiered storage
+     */
+    std::vector<TierView> GetTierViews() const;
 
     /**
      * @brief Read data and transfer to remote destination buffers
@@ -95,6 +118,24 @@ class DataManager {
         const std::string& key,
         const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
+
+    /**
+     * @brief Rectify stale read route by checking local key existence
+     * and removing replica from master if key is not found locally.
+     *
+     * @param key Object key to rectify
+     * @param tier_id Optional tier ID. If specified, only checks the given
+     *        tier; if nullopt, checks all tiers.
+     */
+    void RectifyReadRoute(const std::string& key,
+                          std::optional<UUID> tier_id = std::nullopt);
+
+    /**
+     * @brief Set the callback for rectifying read routes in Master.
+     * @param fn Callback invoked when key not found locally.
+     */
+    void SetRectifyCallback(
+        std::function<void(const std::string&, std::optional<UUID>)> fn);
 
    private:
     std::shared_mutex& GetKeyLock(const std::string& key) {
@@ -132,7 +173,8 @@ class DataManager {
      * @return ErrorCode indicating success or failure
      */
     tl::expected<void, ErrorCode> WaitTransferBatch(
-        BatchID batch_id, size_t num_tasks, const std::string& segment_name);
+        BatchID batch_id, size_t num_tasks,
+        const std::string& segment_endpoint);
 
     /**
      * @brief Validate remote buffer descriptors
@@ -192,13 +234,13 @@ class DataManager {
      * @return BatchID if successful, or error
      */
     tl::expected<BatchID, ErrorCode> SubmitTransferRequests(
-        const std::string& segment_name, SegmentHandle seg,
+        const std::string& segment_endpoint, SegmentHandle seg,
         const std::vector<TransferRequest>& requests,
         const std::string& function_name);
 
     /**
      * @brief Wait for multiple transfer batches to complete
-     * @param batches Vector of (batch_id, num_tasks, segment_name) tuples
+     * @param batches Vector of (batch_id, num_tasks, segment_endpoint) tuples
      * @param function_name Name of the calling function for logging
      * @return ErrorCode indicating success or failure. If any batch fails,
      *         remaining batch IDs are freed and error is returned immediately.
@@ -214,6 +256,10 @@ class DataManager {
     // (default: 1024)
     size_t lock_shard_count_;
     std::vector<std::shared_mutex> lock_shards_;
+
+    // Callback for rectifying stale read routes
+    std::function<void(const std::string&, std::optional<UUID>)>
+        rectify_wrong_route_fn_;
 };
 
 }  // namespace mooncake

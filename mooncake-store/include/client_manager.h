@@ -154,6 +154,12 @@ class ClientManager {
     virtual std::shared_ptr<ClientMeta> CreateClientMeta(
         const RegisterClientRequest& req) = 0;
 
+    /**
+     * @brief Get the deployment mode of this ClientManager.
+     * Used for architecture validation during client registration.
+     */
+    virtual DeploymentMode GetDeploymentMode() const = 0;
+
    protected:
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks

@@ -64,6 +64,12 @@ class SchedulerPolicy {
     virtual std::vector<SchedAction> Decide(
         const std::unordered_map<UUID, TierStats>& tier_stats,
         const std::vector<KeyContext>& active_keys) = 0;
+
+    /**
+     * @brief Set the fast tier ID for the policy.
+     * @param id The UUID of the fast tier (e.g., DRAM).
+     */
+    virtual void SetFastTier(UUID id) {}
 };
 
 }  // namespace mooncake

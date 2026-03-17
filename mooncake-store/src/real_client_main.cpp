@@ -1,7 +1,8 @@
 #include <gflags/gflags.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "client_service.h"
+#include <variant>
+#include "client_config_builder.h"
 #include "real_client.h"
 
 using namespace mooncake;
@@ -17,10 +18,17 @@ DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
+DEFINE_string(tiered_backend_config, "",
+              "Tiered backend config json. Empty means load from env "
+              "MOONCAKE_TIERED_CONFIG");
+DEFINE_string(deployment_mode, "Centralization",
+              "Client type: 'Centralization' or 'P2P'");
+DEFINE_uint32(client_rpc_port, 12345, "Client RPC service port (P2P mode)");
+DEFINE_uint32(rpc_thread_num, 16, "Number of threads for P2P RPC service");
 
 namespace mooncake {
-void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
-                              RealClient &real_client) {
+void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
+                              RealClient& real_client) {
     server.register_handler<&RealClient::put_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_batch_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_parts_dummy_helper>(&real_client);
@@ -45,23 +53,59 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
 }
 }  // namespace mooncake
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
+    // Attention !!!
+    // Initialization of ResourceTracker must be the most earliest.
+    // Otherwise, the main thread will not apply signal mask before other
+    // spawning threads, leading to missing signal processing.
+    mooncake::ResourceTracker::getInstance();
+
     gflags::ParseCommandLineFlags(&argc, &argv, true);
-    size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
+    // when separately deploy real client,
+    // local buffer is shared by dummy client,
+    // real client does not have local buffer
+    const uint64_t local_buffer_size = 0;
+    const size_t global_segment_size =
+        string_to_byte_size(FLAGS_global_segment_size);
+
+    auto config =
+        [&]() -> std::variant<CentralizedClientConfig, P2PClientConfig> {
+        if (FLAGS_deployment_mode == "P2P") {
+            LOG(INFO) << "Using P2P client type"
+                      << ", client_rpc_port=" << FLAGS_client_rpc_port;
+            return ClientConfigBuilder::build_p2p_real_client(
+                FLAGS_host, FLAGS_metadata_server, FLAGS_protocol,
+                FLAGS_device_names.empty()
+                    ? std::nullopt
+                    : std::optional<std::string>(FLAGS_device_names),
+                FLAGS_master_server_address, FLAGS_tiered_backend_config,
+                local_buffer_size, nullptr,
+                "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
+                static_cast<uint16_t>(FLAGS_client_rpc_port),
+                static_cast<uint32_t>(FLAGS_rpc_thread_num));
+        } else {
+            if (FLAGS_deployment_mode != "Centralization") {
+                LOG(WARNING)
+                    << "Unknown deployment_mode '" << FLAGS_deployment_mode
+                    << "', defaulting to Centralization";
+            }
+            return ClientConfigBuilder::build_centralized_real_client(
+                FLAGS_host, FLAGS_metadata_server, FLAGS_protocol,
+                FLAGS_device_names.empty()
+                    ? std::nullopt
+                    : std::optional<std::string>(FLAGS_device_names),
+                FLAGS_master_server_address, global_segment_size,
+                local_buffer_size, nullptr,
+                "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
+                FLAGS_enable_offload);
+        }
+    }();
 
     auto client_inst = RealClient::create();
-    auto res = client_inst->setup_internal(
-        FLAGS_host, FLAGS_metadata_server, global_segment_size, 0,
-        FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
-        nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-        FLAGS_enable_offload);
+    auto res = std::visit(
+        [&](auto& cfg) { return client_inst->setup_internal(cfg); }, config);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
-        return -1;
-    }
-
-    if (client_inst->start_dummy_client_monitor()) {
-        LOG(FATAL) << "Failed to start dummy client monitor thread";
         return -1;
     }
 

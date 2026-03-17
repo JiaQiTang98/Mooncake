@@ -12,7 +12,8 @@
 #include <vector>
 
 #include "allocator.h"
-#include "client_service.h"
+#include "centralized_client_service.h"
+#include "p2p_client_service.h"
 #include "types.h"
 #include "utils.h"
 
@@ -23,6 +24,13 @@ DEFINE_string(device_name, "erdma_0",
 DEFINE_string(master_address, "localhost:50051", "Address of master server");
 DEFINE_int32(num_threads, 8, "Number of concurrent worker threads");
 DEFINE_int32(test_operation_nums, 100, "Number of operations per thread");
+
+// Client configurations
+DEFINE_string(client_type, "Centralized", "Type of client: Centralized | P2P");
+DEFINE_string(tiered_backend_config,
+              "{\"tiers\": [{\"type\": \"DRAM\", \"capacity\": 16106127360, "
+              "\"priority\": 10, \"allocator_type\": \"OFFSET\" }]}",
+              "Tiered backend config json for P2P mode");
 
 DEFINE_int32(value_size, 1048576, "Size of values in bytes (default: 1MB)");
 
@@ -41,7 +49,7 @@ namespace mooncake {
 namespace benchmark {
 
 // Global client and allocator instances
-std::shared_ptr<Client> g_client = nullptr;
+std::shared_ptr<ClientService> g_client = nullptr;
 std::unique_ptr<SimpleAllocator> g_client_buffer_allocator = nullptr;
 void* g_segment_ptr = nullptr;
 size_t g_ram_buffer_size = 0;
@@ -62,6 +70,11 @@ struct ThreadStats {
 };
 
 bool initialize_segment() {
+    if (FLAGS_client_type == "P2P") {
+        LOG(INFO) << "Skipping segment initialization for P2P mode";
+        return true;
+    }
+
     // Use gflags configuration for RAM buffer size
     g_ram_buffer_size = FLAGS_ram_buffer_size_gb * 1024ull * 1024 * 1024;
     g_segment_ptr = allocate_buffer_allocator_memory(g_ram_buffer_size);
@@ -83,6 +96,10 @@ bool initialize_segment() {
 }
 
 void cleanup_segment() {
+    if (FLAGS_client_type == "P2P") {
+        return;
+    }
+
     if (g_segment_ptr && g_client) {
         auto result =
             g_client->UnmountSegment(g_segment_ptr, g_ram_buffer_size);
@@ -94,10 +111,20 @@ void cleanup_segment() {
 }
 
 bool initialize_client() {
-    auto client_opt = Client::Create(
-        FLAGS_local_hostname,              // Local hostname
-        FLAGS_metadata_connection_string,  // Metadata connection string
-        FLAGS_protocol, FLAGS_master_address);
+    std::optional<std::shared_ptr<ClientService>> client_opt;
+
+    if (FLAGS_client_type == "P2P") {
+        auto config = ClientConfigBuilder::build_p2p_real_client(
+            FLAGS_local_hostname, FLAGS_metadata_connection_string,
+            FLAGS_protocol, std::nullopt, FLAGS_master_address,
+            FLAGS_tiered_backend_config);
+        client_opt = ClientService::Create(config);
+    } else {
+        auto config = ClientConfigBuilder::build_centralized_real_client(
+            FLAGS_local_hostname, FLAGS_metadata_connection_string,
+            FLAGS_protocol, std::nullopt, FLAGS_master_address);
+        client_opt = ClientService::Create(config);
+    }
 
     if (!client_opt.has_value()) {
         LOG(ERROR) << "Failed to create client";
@@ -106,7 +133,7 @@ bool initialize_client() {
 
     LOG(INFO) << "Create client successfully";
 
-    g_client = *client_opt;
+    g_client = client_opt.value();
 
     // Use gflags configuration for client buffer allocator size
     auto client_buffer_allocator_size =
@@ -168,8 +195,17 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     slices.emplace_back(
         Slice{write_buffer, static_cast<size_t>(FLAGS_value_size)});
 
-    ReplicateConfig config;
-    config.replica_num = 1;
+    WriteConfig config = [&]() -> WriteConfig {
+        if (FLAGS_client_type == "P2P") {
+            WriteRouteRequestConfig p2p_config;
+            p2p_config.max_candidates = 1;
+            return p2p_config;
+        } else {
+            ReplicateConfig rep_config;
+            rep_config.replica_num = 1;
+            return rep_config;
+        }
+    }();
 
     std::vector<std::string> stored_keys;  // Track keys for GET operations
 
@@ -207,14 +243,17 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
         std::string key = stored_keys[key_index];
 
         auto start_time = std::chrono::high_resolution_clock::now();
-        auto result = g_client->Get(key.data(), slices);
+        auto query_result = g_client->Query(key);
+        bool success = query_result.has_value();
+        if (success) {
+            auto get_result = g_client->Get(key, *query_result.value(), slices);
+            success = get_result.has_value();
+        }
         auto end_time = std::chrono::high_resolution_clock::now();
 
         auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
                               end_time - start_time)
                               .count();
-
-        bool success = result.has_value();
         stats.operations.push_back(
             {static_cast<double>(latency_us), false, success});
 

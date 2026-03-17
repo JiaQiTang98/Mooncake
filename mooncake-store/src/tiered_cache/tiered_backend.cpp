@@ -24,25 +24,70 @@ AllocationEntry::~AllocationEntry() {
 TieredBackend::TieredBackend() = default;
 
 TieredBackend::~TieredBackend() {
+    Stop();
+    Destroy();
+}
+
+void TieredBackend::Stop() {
+    // Ensure this runs only once.
+    bool expected = false;
+    if (!is_shutting_down_.compare_exchange_strong(expected, true,
+                                                   std::memory_order_acq_rel)) {
+        return;  // Already shutting down or shut down.
+    }
+
+    LOG(INFO) << "TieredBackend::Stop() — stopping scheduler";
+
     if (scheduler_) {
         scheduler_->Stop();
     }
-    // Explicitly flush all tiers to ensure pending data is written before
-    // metadata and buffers (held in metadata_index_) are destroyed.
-    for (auto& [id, tier] : tiers_) {
-        if (tier) {
-            auto res = tier->Flush();
-            if (!res) {
-                LOG(ERROR) << "Failed to flush tier " << id
-                           << " during shutdown: " << res.error();
+
+    LOG(INFO) << "TieredBackend::Stop() — complete";
+}
+
+void TieredBackend::Destroy() {
+    bool expected = false;
+    if (!is_destroyed_.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel)) {
+        return;  // Already destroyed.
+    }
+
+    LOG(INFO) << "TieredBackend::Destroy() — unmounting segments";
+
+    // Unmount segments from Master
+    for (const auto& [id, tier] : tiers_) {
+        if (!tier) continue;
+        const auto& info = tier_info_.at(id);
+        Segment segment;
+        segment.extra = P2PSegmentExtraData{};
+        segment.id = id;
+        segment.name = "tier_" + std::to_string(id.first) + "_" +
+                       std::to_string(id.second);
+        segment.size = tier->GetCapacity();
+        auto& p2p_extra = segment.GetP2PExtra();
+        p2p_extra.priority = info.priority;
+        p2p_extra.tags = info.tags;
+        p2p_extra.memory_type = tier->GetMemoryType();
+        p2p_extra.usage = tier->GetUsage();
+
+        if (segment_sync_callback_) {
+            auto result = segment_sync_callback_(segment, /*mount=*/false);
+            if (!result) {
+                LOG(WARNING)
+                    << "Failed to unmount segment on destroy: tier_id=" << id
+                    << ", error=" << result.error();
             }
         }
     }
+
+    LOG(INFO) << "TieredBackend::Destroy() — complete";
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Init(
     Json::Value root, TransferEngine* engine,
-    MetadataSyncCallback sync_callback) {
+    AddReplicaCallback add_replica_callback,
+    RemoveReplicaCallback remove_replica_callback,
+    SegmentSyncCallback segment_sync_callback) {
     // Initialize DataCopier
     try {
         DataCopierBuilder builder;
@@ -53,7 +98,10 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     }
 
     // Register callback for syncing metadata to Master
-    metadata_sync_callback_ = sync_callback;
+    add_replica_callback_ = add_replica_callback;
+    remove_replica_callback_ = remove_replica_callback;
+    // Register callback for segment lifecycle synchronization with Master
+    segment_sync_callback_ = segment_sync_callback;
 
     // Initialize Tiers
     if (!root.isMember("tiers")) {
@@ -96,7 +144,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
 
         // Generate UUID for this tier
         UUID id = generate_uuid();
-
+        MemoryType memory_type;
         // Instantiate tier based on type
         if (type == "DRAM") {
             // Parse NUMA node
@@ -142,6 +190,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
 
             tiers_[id] = std::move(tier);
             tier_info_[id] = {priority, tags};
+            memory_type = MemoryType::DRAM;
             LOG(INFO) << "Successfully initialized DRAM tier: id=" << id;
         }
 #ifdef USE_ASCEND_CACHE_TIER
@@ -167,6 +216,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
 
             tiers_[id] = std::move(tier);
             tier_info_[id] = {priority, tags};
+            memory_type = MemoryType::ASCEND_NPU;
             LOG(INFO) << "Successfully initialized ASCEND_NPU tier: id=" << id;
         }
 #endif
@@ -182,10 +232,19 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             }
             tiers_[id] = std::move(tier);
             tier_info_[id] = {priority, tags};
+            memory_type = MemoryType::NVME;
             LOG(INFO) << "Successfully initialized Storage tier: id=" << id;
         } else {
             LOG(ERROR) << "Unsupported tier type '" << type << "'";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        auto mount_result =
+            MountSegment(id, capacity, priority, tags, memory_type);
+        if (!mount_result) {
+            LOG(ERROR) << "Failed to mount tier: id=" << id
+                       << ", error=" << mount_result.error();
+            return mount_result;
         }
     }
 
@@ -210,6 +269,32 @@ std::vector<UUID> TieredBackend::GetSortedTiers() const {
         return tier_info_.at(a).priority > tier_info_.at(b).priority;
     });
     return ids;
+}
+
+tl::expected<void, ErrorCode> TieredBackend::MountSegment(
+    UUID id, size_t capacity, int priority,
+    const std::vector<std::string>& tags, MemoryType memory_type) {
+    Segment segment;
+    segment.extra = P2PSegmentExtraData{};
+    segment.id = id;
+    segment.name =
+        "tier_" + std::to_string(id.first) + "_" + std::to_string(id.second);
+    segment.size = capacity;
+    auto& p2p_extra = segment.GetP2PExtra();
+    p2p_extra.priority = priority;
+    p2p_extra.tags = tags;
+    p2p_extra.memory_type = memory_type;
+    p2p_extra.usage = 0;
+
+    if (segment_sync_callback_) {
+        auto mount_result = segment_sync_callback_(segment, /*mount=*/true);
+        if (!mount_result) {
+            LOG(ERROR) << "Failed to mount segment with Master: id=" << id
+                       << ", error=" << mount_result.error();
+            return tl::unexpected(mount_result.error());
+        }
+    }
+    return {};
 }
 
 bool TieredBackend::AllocateInternalRaw(size_t size,
@@ -248,6 +333,10 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
     size_t size, std::optional<UUID> preferred_tier, bool strict) {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
     TieredLocation loc;
 
     // Strict mode: must allocate on preferred tier
@@ -323,6 +412,10 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
 
 tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
                                                    AllocationHandle handle) {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     if (!data_copier_) {
         LOG(ERROR) << "TieredBackend not initialized";
@@ -339,6 +432,10 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
 tl::expected<void, ErrorCode> TieredBackend::Commit(
     const std::string& key, AllocationHandle handle,
     std::optional<uint64_t> expected_version) {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
     std::shared_ptr<MetadataEntry> entry = nullptr;
@@ -387,17 +484,6 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
         return tl::make_unexpected(tier_commit_res.error());
     }
 
-    if (metadata_sync_callback_) {
-        auto result =
-            metadata_sync_callback_(key, handle->loc.tier->GetTierId(), COMMIT);
-
-        if (!result.has_value()) {
-            LOG(ERROR) << "Failed to Commit key " << key
-                       << " to Master, error_code=" << result.error();
-            return tl::make_unexpected(result.error());
-        }
-    }
-
     // Update Entry (Entry Write Lock)
     {
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
@@ -438,12 +524,29 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
         }
     }
 
+    if (add_replica_callback_) {
+        size_t data_size =
+            handle->loc.data.buffer ? handle->loc.data.buffer->size() : 0;
+        auto result = add_replica_callback_(key, handle->loc.tier->GetTierId(),
+                                            data_size);
+
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to Commit key " << key
+                       << " to Master, error_code=" << result.error();
+            return tl::make_unexpected(result.error());
+        }
+    }
+
     return tl::expected<void, ErrorCode>{};
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
     const std::string& key, std::optional<UUID> tier_id, bool record_access,
     uint64_t* out_version) {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
     std::shared_ptr<MetadataEntry> entry = nullptr;
 
     // Find Entry (Global Read Lock)
@@ -452,7 +555,7 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
         auto it = metadata_index_.find(key);
         if (it == metadata_index_.end()) {
             LOG(ERROR) << "Key not found: " << key;
-            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         entry = it->second;
     }
@@ -488,8 +591,33 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
     return entry->replicas.begin()->second;
 }
 
+bool TieredBackend::Exist(const std::string& key,
+                          std::optional<UUID> tier_id) const {
+    std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
+    auto it = metadata_index_.find(key);
+    if (it == metadata_index_.end()) {
+        return false;  // Key not found
+    }
+    if (!tier_id.has_value()) {
+        return true;  // Key exists in backend
+    }
+    // Check specific tier
+    auto entry = it->second;
+    std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
+    for (const auto& replica : entry->replicas) {
+        if (replica.first == *tier_id) {
+            return true;  // Key exists in target tier
+        }
+    }
+    return false;  // Key does not exist in target tier
+}
+
 tl::expected<void, ErrorCode> TieredBackend::Delete(
     const std::string& key, std::optional<UUID> tier_id) {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
     // Hold references locally to ensure destruction happens OUTSIDE the
     // locks This is crucial for non-blocking deletions.
     AllocationHandle handle_ref = nullptr;
@@ -506,44 +634,44 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
         {
             std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
             auto it = metadata_index_.find(key);
-            if (it != metadata_index_.end()) {
-                auto entry = it->second;
+            if (it == metadata_index_.end()) {
+                LOG(ERROR) << "Key not found: " << key;
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
+            auto entry = it->second;
 
-                std::unique_lock<std::shared_mutex> entry_write_lock(
-                    entry->mutex);
-                auto tier_it = entry->replicas.end();
-                for (auto it = entry->replicas.begin();
-                     it != entry->replicas.end(); ++it) {
-                    if (it->first == *tier_id) {
-                        tier_it = it;
-                        break;
+            std::unique_lock<std::shared_mutex> entry_write_lock(entry->mutex);
+            auto tier_it = entry->replicas.end();
+            for (auto it = entry->replicas.begin(); it != entry->replicas.end();
+                 ++it) {
+                if (it->first == *tier_id) {
+                    tier_it = it;
+                    break;
+                }
+            }
+
+            if (tier_it != entry->replicas.end()) {
+                if (remove_replica_callback_) {
+                    auto result = remove_replica_callback_(
+                        key, tier_it->second->loc.tier->GetTierId(), DELETE);
+                    if (!result.has_value()) {
+                        LOG(ERROR)
+                            << "Failed to Delete key " << key << " in Tier "
+                            << tier_it->second->loc.tier->GetTierId()
+                            << " for Master, error_code=" << result.error();
+                        return tl::make_unexpected(result.error());
                     }
                 }
+                handle_ref =
+                    tier_it->second;  // Capture reference (+1 ref count)
+                entry->replicas.erase(tier_it);
+                entry->version++;  // Increment version on replica deletion
+                found_tier = true;
+            }
 
-                if (tier_it != entry->replicas.end()) {
-                    if (metadata_sync_callback_) {
-                        auto result = metadata_sync_callback_(
-                            key, tier_it->second->loc.tier->GetTierId(),
-                            DELETE);
-                        if (!result.has_value()) {
-                            LOG(ERROR)
-                                << "Failed to Delete key " << key << " in Tier "
-                                << tier_it->second->loc.tier->GetTierId()
-                                << " for Master, error_code=" << result.error();
-                            return tl::make_unexpected(result.error());
-                        }
-                    }
-                    handle_ref =
-                        tier_it->second;  // Capture reference (+1 ref count)
-                    entry->replicas.erase(tier_it);
-                    entry->version++;  // Increment version on replica deletion
-                    found_tier = true;
-                }
-
-                // Mark for cleanup if entry becomes empty
-                if (entry->replicas.empty()) {
-                    need_cleanup = true;
-                }
+            // Mark for cleanup if entry becomes empty
+            if (entry->replicas.empty()) {
+                need_cleanup = true;
             }
         }  // Read lock released here
 
@@ -583,11 +711,11 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
         auto it = metadata_index_.find(key);
         if (it == metadata_index_.end()) {
             LOG(ERROR) << "Key not found: " << key;
-            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         UUID invalid_id{0, 0};
-        if (metadata_sync_callback_) {
-            auto result = metadata_sync_callback_(key, invalid_id, DELETE_ALL);
+        if (remove_replica_callback_) {
+            auto result = remove_replica_callback_(key, invalid_id, DELETE_ALL);
             if (!result.has_value()) {
                 LOG(ERROR) << "Failed to Delete key " << key
                            << " for Master, error_code=" << result.error();
@@ -622,6 +750,10 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
 tl::expected<void, ErrorCode> TieredBackend::CopyData(
     const std::string& key, const DataSource& source, UUID dest_tier_id,
     std::optional<uint64_t> expected_version) {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
     if (!source.buffer || source.buffer->size() == 0) {
         LOG(ERROR) << "Invalid source buffer or size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -658,6 +790,10 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
 tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
                                                       UUID source_tier_id,
                                                       UUID dest_tier_id) {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
     uint64_t start_version = 0;
     auto source_handle_res = Get(key, source_tier_id, false, &start_version);
     if (!source_handle_res) {

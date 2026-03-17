@@ -234,11 +234,12 @@ TEST_F(IPv6ClientTest, BasicPutGetOverIPv6Loopback) {
     LOG(INFO) << "Setting up client with server address: "
               << FLAGS_server_address;
 
-    ASSERT_EQ(
-        client_->setup_real(FLAGS_server_address, "P2PHANDSHAKE",
-                            16 * 1024 * 1024, 16 * 1024 * 1024, FLAGS_protocol,
-                            rdma_devices, master_address_),
-        0)
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
+        rdma_devices.empty() ? std::nullopt
+                             : std::optional<std::string>(rdma_devices),
+        master_address_, 0, 16 * 1024 * 1024);
+    ASSERT_EQ(client_->setup(config), 0)
         << "Client setup should succeed with IPv6 address";
 
     // Test Put operation
@@ -246,10 +247,10 @@ TEST_F(IPv6ClientTest, BasicPutGetOverIPv6Loopback) {
     const std::string key = "ipv6_test_key";
 
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig config;
-    config.replica_num = 1;
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
 
-    int put_result = client_->put(key, data_span, config);
+    int put_result = client_->put(key, data_span, replicate_config);
     EXPECT_EQ(put_result, 0) << "Put operation should succeed over IPv6";
 
     // Test Get operation
@@ -300,11 +301,12 @@ TEST_F(IPv6ClientTest, BasicPutGetOverLinkLocalIPv6) {
                                          ? FLAGS_device_name
                                          : std::string("");
 
-    ASSERT_EQ(
-        client_->setup_real(server_address, "P2PHANDSHAKE", 16 * 1024 * 1024,
-                            16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
-                            master_address_),
-        0)
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        server_address, "P2PHANDSHAKE", FLAGS_protocol,
+        rdma_devices.empty() ? std::nullopt
+                             : std::optional<std::string>(rdma_devices),
+        master_address_, 0, 16 * 1024 * 1024);
+    ASSERT_EQ(client_->setup(config), 0)
         << "Client setup should succeed with link-local IPv6 address";
 
     // Test Put operation
@@ -312,10 +314,10 @@ TEST_F(IPv6ClientTest, BasicPutGetOverLinkLocalIPv6) {
     const std::string key = "ipv6_linklocal_test_key";
 
     std::span<const char> data_span(test_data.data(), test_data.size());
-    ReplicateConfig config;
-    config.replica_num = 1;
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
 
-    int put_result = client_->put(key, data_span, config);
+    int put_result = client_->put(key, data_span, replicate_config);
     EXPECT_EQ(put_result, 0)
         << "Put operation should succeed over link-local IPv6";
 
@@ -353,11 +355,12 @@ TEST_F(IPv6ClientTest, BatchOperationsOverIPv6) {
                                          ? FLAGS_device_name
                                          : std::string("");
 
-    ASSERT_EQ(
-        client_->setup_real(FLAGS_server_address, "P2PHANDSHAKE",
-                            16 * 1024 * 1024, 16 * 1024 * 1024, FLAGS_protocol,
-                            rdma_devices, master_address_),
-        0);
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        FLAGS_server_address, "P2PHANDSHAKE", FLAGS_protocol,
+        rdma_devices.empty() ? std::nullopt
+                             : std::optional<std::string>(rdma_devices),
+        master_address_, 0, 16 * 1024 * 1024);
+    ASSERT_EQ(client_->setup(config), 0);
 
     // Prepare batch data
     const int num_keys = 10;
@@ -377,10 +380,11 @@ TEST_F(IPv6ClientTest, BatchOperationsOverIPv6) {
     }
 
     // Batch Put
-    ReplicateConfig config;
-    config.replica_num = 1;
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
 
-    int batch_put_result = client_->put_batch(keys, data_spans, config);
+    int batch_put_result =
+        client_->put_batch(keys, data_spans, replicate_config);
     EXPECT_EQ(batch_put_result, 0) << "Batch put should succeed over IPv6";
 
     // Batch Get

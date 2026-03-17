@@ -41,6 +41,9 @@ tl::expected<void, ErrorCode> ClientMeta::MountSegment(const Segment& segment) {
             return ret;
         }
     }
+    LOG(INFO) << "Mount segment success"
+              << ", client_id=" << client_id_ << ", segment_id =" << segment.id
+              << ", segment_name=" << segment.name;
     return {};
 }
 
@@ -70,6 +73,8 @@ tl::expected<void, ErrorCode> ClientMeta::UnmountSegment(
             return ret;
         }
     }
+    LOG(INFO) << "Unmount segment success"
+              << ", client_id=" << client_id_ << ", segment_id =" << segment_id;
     return {};
 }
 

@@ -105,7 +105,7 @@ DEFINE_uint64(
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 DEFINE_string(deployment_mode, "Centralization",
               "the deployment mode of mooncake-store, master and client must "
-              "run in same mode");
+              "run in same mode. Options: Centralization, P2P");
 DEFINE_uint64(max_replicas_per_key, 1,
               "Maximum number of replicas per key in P2P mode (0 = no limit)");
 

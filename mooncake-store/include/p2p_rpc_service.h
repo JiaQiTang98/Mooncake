@@ -23,6 +23,9 @@ class WrappedP2PMasterService final : public WrappedMasterService {
     tl::expected<void, ErrorCode> RemoveReplica(
         const RemoveReplicaRequest& req);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchRemoveReplica(
+        const BatchRemoveReplicaRequest& req);
+
    private:
     P2PMasterService master_service_;
 };

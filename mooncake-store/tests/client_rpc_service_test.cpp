@@ -55,7 +55,8 @@ class ClientRpcServiceTest : public ::testing::Test {
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
         tiered_backend_ = std::make_unique<TieredBackend>();
-        auto init_result = tiered_backend_->Init(config, nullptr, nullptr);
+        auto init_result =
+            tiered_backend_->Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(init_result.has_value())
             << "Failed to initialize TieredBackend: " << init_result.error();
 
@@ -97,10 +98,10 @@ class ClientRpcServiceTest : public ::testing::Test {
     }
 
     // Helper: Create a valid RemoteBufferDesc
-    RemoteBufferDesc CreateBufferDesc(const std::string& segment_name,
+    RemoteBufferDesc CreateBufferDesc(const std::string& segment_endpoint,
                                       uintptr_t addr, uint64_t size) {
         RemoteBufferDesc desc;
-        desc.segment_name = segment_name;
+        desc.segment_endpoint = segment_endpoint;
         desc.addr = addr;
         desc.size = size;
         return desc;
@@ -123,8 +124,7 @@ TEST_F(ClientRpcServiceTest, ReadRemoteDataSuccess) {
     const std::string key = "test_read_key";
     const std::string test_data = "Hello, World!";
     auto buffer = StringToBuffer(test_data);
-    auto put_result =
-        data_manager_->Put(key, std::move(buffer), test_data.size());
+    auto put_result = data_manager_->Put(key, {buffer.get(), test_data.size()});
     ASSERT_TRUE(put_result.has_value()) << "Put failed";
 
     // Create read request with valid buffers

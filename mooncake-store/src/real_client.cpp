@@ -14,12 +14,10 @@
 
 #include "real_client.h"
 #include "client_buffer.hpp"
-#include "config.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
 #include "rpc_types.h"
-#include "file_storage.h"
 #include "default_config.h"
 
 namespace mooncake {
@@ -131,6 +129,14 @@ void ResourceTracker::startSignalThread() {
                     sigemptyset(&sa.sa_mask);
                     sa.sa_flags = 0;
                     sigaction(sig, &sa, nullptr);
+
+                    // Unblock the signal before raising it so it can be
+                    // delivered immediately
+                    sigset_t unblock_set;
+                    sigemptyset(&unblock_set);
+                    sigaddset(&unblock_set, sig);
+                    pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
+
                     raise(sig);
 
                     break;  // Should not reach due to process termination
@@ -156,20 +162,25 @@ std::shared_ptr<RealClient> RealClient::create() {
     return sp;
 }
 
-tl::expected<void, ErrorCode> RealClient::setup_internal(
-    const std::string& local_hostname, const std::string& metadata_server,
-    size_t global_segment_size, size_t local_buffer_size,
-    const std::string& protocol, const std::string& rdma_devices,
-    const std::string& master_server_addr,
-    const std::shared_ptr<TransferEngine>& transfer_engine,
-    const std::string& ipc_socket_path, bool enable_offload) {
-    this->protocol = protocol;
-    this->ipc_socket_path_ = ipc_socket_path;
+template <typename ConfigT>
+int RealClient::setup(ConfigT& config) {
+    return to_py_ret(setup_internal(config));
+}
 
-    // Remove port if hostname already contains one
-    std::string hostname = local_hostname;
-    size_t colon_pos = hostname.find(":");
-    if (colon_pos == std::string::npos) {
+// Explicit template instantiations
+template tl::expected<void, ErrorCode> RealClient::setup_internal(
+    CentralizedClientConfig&);
+template tl::expected<void, ErrorCode> RealClient::setup_internal(
+    P2PClientConfig&);
+template int RealClient::setup(CentralizedClientConfig&);
+template int RealClient::setup(P2PClientConfig&);
+
+template <typename ConfigT>
+tl::expected<void, ErrorCode> RealClient::setup_internal(ConfigT& config) {
+    this->protocol = config.protocol;
+    this->ipc_socket_path_ = config.ipc_socket_path;
+
+    if (config.te_port == 0) {
         // Create port binder to hold a port
         port_binder_ = std::make_unique<AutoPortBinder>();
         int port = port_binder_->getPort();
@@ -177,36 +188,30 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(ERROR) << "Failed to bind available port";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        this->local_hostname = hostname + ":" + std::to_string(port);
-    } else {
-        this->local_hostname = local_hostname;
+        config.te_port = static_cast<uint16_t>(port);
     }
+    this->local_ip = config.local_ip;
+    this->te_port = config.te_port;
 
-    std::optional<std::string> device_name =
-        (rdma_devices.empty() ? std::nullopt
-                              : std::make_optional(rdma_devices));
-
-    auto client_opt = mooncake::Client::Create(
-        this->local_hostname, metadata_server, protocol, device_name,
-        master_server_addr, transfer_engine);
+    auto client_opt = mooncake::ClientService::Create(config);
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    client_ = *client_opt;
+    client_service_ = *client_opt;
 
-    // Local_buffer_size is allowed to be 0, but we only register memory when
-    // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
+    // Local_buffer_size is allowed to be 0 when we use separately deployment.
+    // If it is 0, skip registering local memory in real client.
+    // Dummy Client can create shm and share it with Real Client.
+    // Moreover, invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
-    // Dummy Client can create shm and share it with Real Client, so Real Client
-    // can create client buffer allocator on the shared memory later.
     client_buffer_allocator_ =
-        ClientBufferAllocator::create(local_buffer_size, this->protocol);
-    if (local_buffer_size > 0) {
-        LOG(INFO) << "Registering local memory: " << local_buffer_size
+        ClientBufferAllocator::create(config.local_buffer_size, this->protocol);
+    if (config.local_buffer_size > 0) {
+        LOG(INFO) << "Registering local memory: " << config.local_buffer_size
                   << " bytes";
-        auto result = client_->RegisterLocalMemory(
-            client_buffer_allocator_->getBase(), local_buffer_size,
+        auto result = client_service_->RegisterLocalMemory(
+            client_buffer_allocator_->getBase(), config.local_buffer_size,
             kWildcardLocation, false, true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
@@ -217,40 +222,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
-    // If global_segment_size is 0, skip mount segment;
-    // If global_segment_size is larger than max_mr_size, split to multiple
-    // mapped_shms.
-    auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
-    uint64_t total_glbseg_size = global_segment_size;  // For logging
-    uint64_t current_glbseg_size = 0;                  // For logging
-    while (global_segment_size > 0) {
-        size_t segment_size = std::min(global_segment_size, max_mr_size);
-        global_segment_size -= segment_size;
-        current_glbseg_size += segment_size;
-        LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
-                  << current_glbseg_size << " of " << total_glbseg_size;
-        void* ptr =
-            allocate_buffer_allocator_memory(segment_size, this->protocol);
-        if (!ptr) {
-            LOG(ERROR) << "Failed to allocate segment memory";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (this->protocol == "ascend") {
-            ascend_segment_ptrs_.emplace_back(ptr);
-        } else {
-            segment_ptrs_.emplace_back(ptr);
-        }
-        auto mount_result = client_->MountSegment(ptr, segment_size);
-        if (!mount_result.has_value()) {
-            LOG(ERROR) << "Failed to mount segment: "
-                       << toString(mount_result.error());
-            return tl::unexpected(mount_result.error());
-        }
-    }
-    if (total_glbseg_size == 0) {
-        LOG(INFO) << "Global segment size is 0, skip mounting segment";
-    }
-
     // Start IPC server to accept FD from dummy clients
     if (!ipc_socket_path_.empty()) {
         if (start_ipc_server() != 0) {
@@ -259,44 +230,28 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
     }
-    if (enable_offload) {
-        auto file_storage_config = FileStorageConfig::FromEnvironment();
-        file_storage_ = std::make_shared<FileStorage>(client_, local_hostname,
-                                                      file_storage_config);
-        auto init_result = file_storage_->Init();
-        if (!init_result) {
-            LOG(ERROR) << "file storage init failed with error: "
-                       << init_result.error();
-            return init_result;
-        }
+    auto res = start_dummy_client_monitor();
+    if (res != 0) {
+        LOG(ERROR) << "Failed to start dummy client monitor";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     return {};
 }
 
-int RealClient::setup_real(
-    const std::string& local_hostname, const std::string& metadata_server,
-    size_t global_segment_size, size_t local_buffer_size,
-    const std::string& protocol, const std::string& rdma_devices,
-    const std::string& master_server_addr,
-    const std::shared_ptr<TransferEngine>& transfer_engine,
-    const std::string& ipc_socket_path) {
-    return to_py_ret(setup_internal(local_hostname, metadata_server,
-                                    global_segment_size, local_buffer_size,
-                                    protocol, rdma_devices, master_server_addr,
-                                    transfer_engine, ipc_socket_path));
-}
-
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
-    const std::string& protocol_, const std::string& device_name,
+    const std::string& protocol, const std::string& device_name,
     size_t mount_segment_size) {
-    if (client_) {
+    if (client_service_) {
         LOG(ERROR) << "Client is already initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     uint64_t buffer_allocator_size = 1024 * 1024 * 1024;
-    return setup_internal("localhost:12345", "127.0.0.1:2379",
-                          mount_segment_size, buffer_allocator_size, protocol_,
-                          device_name);
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        "localhost:12345", "127.0.0.1:2379", protocol,
+        device_name.empty() ? std::nullopt
+                            : std::optional<std::string>(device_name),
+        "127.0.0.1:50051", mount_segment_size, buffer_allocator_size);
+    return setup_internal(config);
 }
 
 int RealClient::initAll(const std::string& protocol_,
@@ -315,17 +270,22 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     stop_ipc_server();
+    stop_dummy_client_monitor();
 
-    if (!client_) {
+    if (!client_service_) {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
+    // Gracefully stop accepting new requests and drain in-flight operations
+    client_service_->Stop();
+    client_service_->Destroy();
+
     // Reset all resources
-    client_.reset();
+    client_service_.reset();
     client_buffer_allocator_.reset();
     port_binder_.reset();
-    segment_ptrs_.clear();
-    local_hostname = "";
+    local_ip = "";
+    te_port = 0;
     device_name = "";
     protocol = "";
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
@@ -356,13 +316,15 @@ int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
 
 tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string& key, std::span<const char> value,
-    const ReplicateConfig& config,
+    const WriteConfig& config,
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
-    if (config.prefer_alloc_in_same_node) {
-        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (std::holds_alternative<ReplicateConfig>(config)) {
+        if (std::get<ReplicateConfig>(config).prefer_alloc_in_same_node) {
+            LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -381,7 +343,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
 
     std::vector<Slice> slices = split_into_slices(buffer_handle);
 
-    auto put_result = client_->Put(key, slices, config);
+    auto put_result = client_service_->Put(key, slices, config);
     if (!put_result) {
         return tl::unexpected(put_result.error());
     }
@@ -391,7 +353,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
 
 tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
     const std::string& key, std::span<const char> value,
-    const ReplicateConfig& config, const UUID& client_id) {
+    const WriteConfig& config, const UUID& client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -404,21 +366,22 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
 }
 
 int RealClient::put(const std::string& key, std::span<const char> value,
-                    const ReplicateConfig& config) {
+                    const WriteConfig& config) {
     return to_py_ret(
         put_internal(key, value, config, client_buffer_allocator_));
 }
 
 tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     const std::vector<std::string>& keys,
-    const std::vector<std::span<const char>>& values,
-    const ReplicateConfig& config,
+    const std::vector<std::span<const char>>& values, const WriteConfig& config,
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
-    if (config.prefer_alloc_in_same_node) {
-        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (std::holds_alternative<ReplicateConfig>(config)) {
+        if (std::get<ReplicateConfig>(config).prefer_alloc_in_same_node) {
+            LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -465,7 +428,8 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         }
     }
 
-    auto results = client_->BatchPut(keys, ordered_batched_slices, config);
+    auto results =
+        client_service_->BatchPut(keys, ordered_batched_slices, config);
 
     // Check if any operations failed
     for (size_t i = 0; i < results.size(); ++i) {
@@ -478,8 +442,8 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
 
 tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
     const std::vector<std::string>& keys,
-    const std::vector<std::span<const char>>& values,
-    const ReplicateConfig& config, const UUID& client_id) {
+    const std::vector<std::span<const char>>& values, const WriteConfig& config,
+    const UUID& client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -494,20 +458,22 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
 
 int RealClient::put_batch(const std::vector<std::string>& keys,
                           const std::vector<std::span<const char>>& values,
-                          const ReplicateConfig& config) {
+                          const WriteConfig& config) {
     return to_py_ret(
         put_batch_internal(keys, values, config, client_buffer_allocator_));
 }
 
 tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     const std::string& key, std::vector<std::span<const char>> values,
-    const ReplicateConfig& config,
+    const WriteConfig& config,
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
-    if (config.prefer_alloc_in_same_node) {
-        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (std::holds_alternative<ReplicateConfig>(config)) {
+        if (std::get<ReplicateConfig>(config).prefer_alloc_in_same_node) {
+            LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -549,7 +515,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     std::vector<Slice> slices = split_into_slices(buffer_handle);
 
     // Perform the put operation - buffer_handle will be automatically released
-    auto put_result = client_->Put(key, slices, config);
+    auto put_result = client_service_->Put(key, slices, config);
     if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
                    << toString(put_result.error());
@@ -561,7 +527,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
 
 tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
     const std::string& key, std::vector<std::span<const char>> values,
-    const ReplicateConfig& config, const UUID& client_id) {
+    const WriteConfig& config, const UUID& client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -576,18 +542,18 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
 
 int RealClient::put_parts(const std::string& key,
                           std::vector<std::span<const char>> values,
-                          const ReplicateConfig& config) {
+                          const WriteConfig& config) {
     return to_py_ret(
         put_parts_internal(key, values, config, client_buffer_allocator_));
 }
 
 tl::expected<void, ErrorCode> RealClient::remove_internal(
     const std::string& key) {
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto remove_result = client_->Remove(key);
+    auto remove_result = client_service_->Remove(key);
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
@@ -600,11 +566,11 @@ int RealClient::remove(const std::string& key) {
 
 tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
     const std::string& str) {
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RemoveByRegex(str);
+    return client_service_->RemoveByRegex(str);
 }
 
 long RealClient::removeByRegex(const std::string& str) {
@@ -612,22 +578,22 @@ long RealClient::removeByRegex(const std::string& str) {
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal() {
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RemoveAll();
+    return client_service_->RemoveAll();
 }
 
 long RealClient::removeAll() { return to_py_ret(removeAll_internal()); }
 
 tl::expected<bool, ErrorCode> RealClient::isExist_internal(
     const std::string& key) {
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->IsExist(key);
+    return client_service_->IsExist(key);
 }
 
 int RealClient::isExist(const std::string& key) {
@@ -659,19 +625,19 @@ std::vector<int> RealClient::batchIsExist(
 
 tl::expected<int64_t, ErrorCode> RealClient::getSize_internal(
     const std::string& key) {
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto query_result = client_->Query(key);
+    auto query_result = client_service_->Query(key);
 
     if (!query_result) {
         return tl::unexpected(query_result.error());
     }
 
     const std::vector<Replica::Descriptor>& replica_list =
-        query_result.value().replicas;
+        query_result.value()->replicas;
 
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
@@ -739,7 +705,7 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
                           reinterpret_cast<uintptr_t>(dummy_base_addr);
 
     if (shm_size > 0) {
-        auto result = client_->RegisterLocalMemory(
+        auto result = client_service_->RegisterLocalMemory(
             shm.shm_buffer, shm_size, kWildcardLocation, false, true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register memory";
@@ -780,8 +746,8 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
 
     for (auto& shm : context.mapped_shms) {
         if (shm.shm_buffer) {
-            auto rc =
-                client_->unregisterLocalMemory(shm.shm_buffer, shm.shm_size);
+            auto rc = client_service_->unregisterLocalMemory(shm.shm_buffer,
+                                                             shm.shm_size);
             if (!rc) {
                 LOG(ERROR) << "Failed to unregister memory";
                 munmap(shm.shm_buffer, shm.shm_size);
@@ -830,8 +796,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
         // Unregister from transfer engine if it was registered
         if (shm_it->shm_size > 0) {
             // Matching the usage in unmap_shm_internal
-            auto res = client_->unregisterLocalMemory(shm_it->shm_buffer,
-                                                      shm_it->shm_size);
+            auto res = client_service_->unregisterLocalMemory(
+                shm_it->shm_buffer, shm_it->shm_size);
             if (!res) {
                 LOG(WARNING)
                     << "Failed to unregister local memory for shared memory: "
@@ -857,8 +823,9 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
 // Implementation of get_buffer_internal method
 std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string& key,
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
-    if (!client_) {
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator,
+    const ReadRouteConfig& config) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return nullptr;
     }
@@ -868,7 +835,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     // Query the object info
-    auto query_result = client_->Query(key);
+    auto query_result = client_service_->Query(key, config);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -880,7 +847,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     const std::vector<Replica::Descriptor>& replica_list =
-        query_result.value().replicas;
+        query_result.value()->replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
         return nullptr;
@@ -907,7 +874,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     allocateSlices(slices, replica, buffer_handle.ptr());
 
     // Get the object data
-    auto get_result = client_->Get(key, query_result.value(), slices);
+    auto get_result = client_service_->Get(key, *query_result.value(), slices);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
@@ -920,13 +887,15 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 }
 
 // Implementation of get_buffer method
-std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string& key) {
-    return get_buffer_internal(key, client_buffer_allocator_);
+std::shared_ptr<BufferHandle> RealClient::get_buffer(
+    const std::string& key, const ReadRouteConfig& config) {
+    return get_buffer_internal(key, client_buffer_allocator_, config);
 }
 
 std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
-    const std::string& key) {
-    auto buffer_handle = get_buffer_internal(key, client_buffer_allocator_);
+    const std::string& key, const ReadRouteConfig& config) {
+    auto buffer_handle =
+        get_buffer_internal(key, client_buffer_allocator_, config);
     if (!buffer_handle) {
         LOG(ERROR) << "Failed to get buffer for key: " << key;
         return std::make_tuple(0, 0);
@@ -938,6 +907,7 @@ std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
 RealClient::get_buffer_info_dummy_helper(const std::string& key,
+                                         const ReadRouteConfig& config,
                                          const UUID& client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
@@ -948,7 +918,7 @@ RealClient::get_buffer_info_dummy_helper(const std::string& key,
     auto& context = it->second;
 
     auto buffer_handle =
-        get_buffer_internal(key, context.client_buffer_allocator);
+        get_buffer_internal(key, context.client_buffer_allocator, config);
     if (!buffer_handle) {
         LOG(ERROR) << "Failed to get buffer for key: " << key;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -974,11 +944,12 @@ RealClient::get_buffer_info_dummy_helper(const std::string& key,
 
 // Implementation of batch_get_buffer_internal method
 std::vector<std::shared_ptr<BufferHandle>>
-RealClient::batch_get_buffer_internal(const std::vector<std::string>& keys) {
+RealClient::batch_get_buffer_internal(const std::vector<std::string>& keys,
+                                      const ReadRouteConfig& config) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return final_results;
     }
@@ -988,13 +959,13 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string>& keys) {
     }
 
     // 1. Query metadata for all keys
-    auto query_results = client_->BatchQuery(keys);
+    auto query_results = client_service_->BatchQuery(keys, config);
 
     // 2. Prepare for batch get: filter valid keys and prepare buffers
     struct KeyOp {
         size_t original_index;
         std::string key;
-        QueryResult query_result;
+        std::unique_ptr<QueryResult> query_result;
         std::unique_ptr<BufferHandle> buffer_handle;
         std::vector<Slice> slices;
     };
@@ -1013,13 +984,13 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string>& keys) {
             continue;
         }
 
-        auto query_result_values = query_results[i].value();
-        if (query_result_values.replicas.empty()) {
+        auto query_result_ptr = std::move(query_results[i].value());
+        if (query_result_ptr->replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             continue;
         }
 
-        const auto& replica = query_result_values.replicas[0];
+        const auto& replica = query_result_ptr->replicas[0];
         uint64_t total_size = calculate_total_size(replica);
         if (total_size == 0) {
             continue;
@@ -1039,7 +1010,7 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string>& keys) {
         valid_ops.emplace_back(
             KeyOp{.original_index = i,
                   .key = key,
-                  .query_result = std::move(query_result_values),
+                  .query_result = std::move(query_result_ptr),
                   .buffer_handle = std::move(buffer_handle),
                   .slices = std::move(slices)});
     }
@@ -1050,19 +1021,19 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string>& keys) {
 
     // 3. Execute batch get
     std::vector<std::string> batch_keys;
-    std::vector<QueryResult> batch_query_results;
+    std::vector<std::unique_ptr<QueryResult>> batch_query_results;
     std::unordered_map<std::string, std::vector<Slice>> batch_slices;
     batch_keys.reserve(valid_ops.size());
     batch_query_results.reserve(valid_ops.size());
 
     for (auto& op : valid_ops) {
         batch_keys.push_back(op.key);
-        batch_query_results.push_back(op.query_result);
+        batch_query_results.push_back(std::move(op.query_result));
         batch_slices[op.key] = op.slices;
     }
 
-    auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+    auto batch_get_results = client_service_->BatchGet(
+        batch_keys, batch_query_results, batch_slices);
 
     // 4. Process results and create BufferHandles
     for (size_t i = 0; i < valid_ops.size(); ++i) {
@@ -1081,18 +1052,18 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string>& keys) {
 
 // Implementation of batch_get_buffer method
 std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
-    const std::vector<std::string>& keys) {
-    return batch_get_buffer_internal(keys);
+    const std::vector<std::string>& keys, const ReadRouteConfig& config) {
+    return batch_get_buffer_internal(keys, config);
 }
 
 tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     void* buffer, size_t size) {
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RegisterLocalMemory(buffer, size, kWildcardLocation, false,
-                                        true);
+    return client_service_->RegisterLocalMemory(buffer, size, kWildcardLocation,
+                                                false, true);
 }
 
 int RealClient::register_buffer(void* buffer, size_t size) {
@@ -1101,11 +1072,12 @@ int RealClient::register_buffer(void* buffer, size_t size) {
 
 tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     void* buffer) {
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto unregister_result = client_->unregisterLocalMemory(buffer, true);
+    auto unregister_result =
+        client_service_->unregisterLocalMemory(buffer, true);
     if (!unregister_result) {
         LOG(ERROR) << "Unregister buffer failed with error: "
                    << toString(unregister_result.error());
@@ -1119,16 +1091,17 @@ int RealClient::unregister_buffer(void* buffer) {
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
-    const std::string& key, void* buffer, size_t size) {
+    const std::string& key, void* buffer, size_t size,
+    const ReadRouteConfig& config) {
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Step 1: Get object info
-    auto query_result = client_->Query(key);
+    auto query_result = client_service_->Query(key, config);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -1141,7 +1114,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
     }
 
     const std::vector<Replica::Descriptor>& replica_list =
-        query_result.value().replicas;
+        query_result.value()->replicas;
 
     // Calculate total size from replica list
     if (replica_list.empty()) {
@@ -1165,7 +1138,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
     allocateSlices(slices, replica, buffer);
 
     // Step 3: Read data directly into user buffer
-    auto get_result = client_->Get(key, query_result.value(), slices);
+    auto get_result = client_service_->Get(key, *query_result.value(), slices);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
@@ -1175,16 +1148,18 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
     return static_cast<int64_t>(total_size);
 }
 
-int64_t RealClient::get_into(const std::string& key, void* buffer,
-                             size_t size) {
-    return to_py_ret(get_into_internal(key, buffer, size));
+int64_t RealClient::get_into(const std::string& key, void* buffer, size_t size,
+                             const ReadRouteConfig& config) {
+    return to_py_ret(get_into_internal(key, buffer, size, config));
 }
 
-std::string RealClient::get_hostname() const { return local_hostname; }
+std::string RealClient::get_hostname() const {
+    return local_ip + ":" + std::to_string(te_port);
+}
 
 std::vector<int> RealClient::batch_put_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes, const ReplicateConfig& config) {
+    const std::vector<size_t>& sizes, const WriteConfig& config) {
     auto internal_results =
         batch_put_from_internal(keys, buffers, sizes, config);
     std::vector<int> results;
@@ -1201,7 +1176,7 @@ std::vector<tl::expected<void, ErrorCode>>
 RealClient::batch_put_from_dummy_helper(
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& dummy_buffers,
-    const std::vector<size_t>& sizes, const ReplicateConfig& config,
+    const std::vector<size_t>& sizes, const WriteConfig& config,
     const UUID& client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
@@ -1252,13 +1227,15 @@ RealClient::batch_put_from_dummy_helper(
 
 std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes, const ReplicateConfig& config) {
-    if (config.prefer_alloc_in_same_node) {
-        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    const std::vector<size_t>& sizes, const WriteConfig& config) {
+    if (std::holds_alternative<ReplicateConfig>(config)) {
+        if (std::get<ReplicateConfig>(config).prefer_alloc_in_same_node) {
+            LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
     }
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -1305,19 +1282,21 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     }
 
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, ordered_batched_slices, config);
+    return client_service_->BatchPut(keys, ordered_batched_slices, config);
 }
 
 tl::expected<void, ErrorCode> RealClient::put_from_internal(
     const std::string& key, void* buffer, size_t size,
-    const ReplicateConfig& config) {
+    const WriteConfig& config) {
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
-    if (config.prefer_alloc_in_same_node) {
-        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (std::holds_alternative<ReplicateConfig>(config)) {
+        if (std::get<ReplicateConfig>(config).prefer_alloc_in_same_node) {
+            LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1338,7 +1317,7 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
         offset += chunk_size;
     }
 
-    auto put_result = client_->Put(key, slices, config);
+    auto put_result = client_service_->Put(key, slices, config);
     if (!put_result) {
         return tl::unexpected(put_result.error());
     }
@@ -1347,14 +1326,15 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
 }
 
 int RealClient::put_from(const std::string& key, void* buffer, size_t size,
-                         const ReplicateConfig& config) {
+                         const WriteConfig& config) {
     return to_py_ret(put_from_internal(key, buffer, size, config));
 }
 
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes) {
-    auto internal_results = batch_get_into_internal(keys, buffers, sizes);
+    const std::vector<size_t>& sizes, const ReadRouteConfig& config) {
+    auto internal_results =
+        batch_get_into_internal(keys, buffers, sizes, config);
     std::vector<int64_t> results;
     results.reserve(internal_results.size());
 
@@ -1369,7 +1349,8 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_dummy_helper(
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& dummy_buffers,
-    const std::vector<size_t>& sizes, const UUID& client_id) {
+    const std::vector<size_t>& sizes, const ReadRouteConfig& config,
+    const UUID& client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -1416,15 +1397,16 @@ RealClient::batch_get_into_dummy_helper(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
     }
-    return batch_get_into_internal(keys, buffers, sizes);
+    return batch_get_into_internal(keys, buffers, sizes, config);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string>& keys,
                                     const std::vector<void*>& buffers,
-                                    const std::vector<size_t>& sizes) {
+                                    const std::vector<size_t>& sizes,
+                                    const ReadRouteConfig& config) {
     // Validate preconditions
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -1447,13 +1429,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string>& keys,
     }
 
     // Query metadata for all keys
-    const auto query_results = client_->BatchQuery(keys);
+    auto query_results = client_service_->BatchQuery(keys);
 
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;
         size_t original_index;
-        QueryResult query_result;
+        std::unique_ptr<QueryResult> query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
     };
@@ -1477,15 +1459,15 @@ RealClient::batch_get_into_internal(const std::vector<std::string>& keys,
         }
 
         // Validate replica list
-        auto query_result_values = query_results[i].value();
-        if (query_result_values.replicas.empty()) {
+        auto query_result_ptr = std::move(query_results[i].value());
+        if (query_result_ptr->replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
             continue;
         }
 
         // Calculate required buffer size
-        const auto& replica = query_result_values.replicas[0];
+        const auto& replica = query_result_ptr->replicas[0];
         uint64_t total_size = calculate_total_size(replica);
 
         // Validate buffer capacity
@@ -1502,12 +1484,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string>& keys,
         allocateSlices(key_slices, replica, buffers[i]);
 
         // Store operation info for batch processing
-        valid_operations.push_back(
-            {.key = key,
-             .original_index = i,
-             .query_result = std::move(query_result_values),
-             .slices = std::move(key_slices),
-             .total_size = total_size});
+        valid_operations.push_back({.key = key,
+                                    .original_index = i,
+                                    .query_result = std::move(query_result_ptr),
+                                    .slices = std::move(key_slices),
+                                    .total_size = total_size});
 
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
@@ -1520,21 +1501,21 @@ RealClient::batch_get_into_internal(const std::vector<std::string>& keys,
 
     // Prepare batch transfer data structures
     std::vector<std::string> batch_keys;
-    std::vector<QueryResult> batch_query_results;
+    std::vector<std::unique_ptr<QueryResult>> batch_query_results;
     std::unordered_map<std::string, std::vector<Slice>> batch_slices;
 
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
 
-    for (const auto& op : valid_operations) {
+    for (auto& op : valid_operations) {
         batch_keys.push_back(op.key);
-        batch_query_results.push_back(op.query_result);
+        batch_query_results.push_back(std::move(op.query_result));
         batch_slices[op.key] = op.slices;
     }
 
     // Execute batch transfer
-    const auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+    const auto batch_get_results = client_service_->BatchGet(
+        batch_keys, batch_query_results, batch_slices);
 
     // Process transfer results
     for (size_t j = 0; j < batch_get_results.size(); ++j) {
@@ -1553,7 +1534,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string>& keys,
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
     const std::vector<std::string>& keys) {
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<bool, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -1565,20 +1546,22 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
     }
 
     // Call client BatchIsExist and return the vector<expected> directly
-    return client_->BatchIsExist(keys);
+    return client_service_->BatchIsExist(keys);
 }
 
 int RealClient::put_from_with_metadata(const std::string& key, void* buffer,
                                        void* metadata_buffer, size_t size,
                                        size_t metadata_size,
-                                       const ReplicateConfig& config) {
+                                       const WriteConfig& config) {
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
-    if (config.prefer_alloc_in_same_node) {
-        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
-        return -1;
+    if (std::holds_alternative<ReplicateConfig>(config)) {
+        if (std::get<ReplicateConfig>(config).prefer_alloc_in_same_node) {
+            LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+            return -1;
+        }
     }
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return -1;
     }
@@ -1608,7 +1591,7 @@ int RealClient::put_from_with_metadata(const std::string& key, void* buffer,
         slices.emplace_back(Slice{chunk_ptr, chunk_size});
         offset += chunk_size;
     }
-    auto put_result = client_->Put(key, slices, config);
+    auto put_result = client_service_->Put(key, slices, config);
     if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
                    << toString(put_result.error());
@@ -1620,8 +1603,7 @@ int RealClient::put_from_with_metadata(const std::string& key, void* buffer,
 std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffers,
-    const std::vector<std::vector<size_t>>& sizes,
-    const ReplicateConfig& config) {
+    const std::vector<std::vector<size_t>>& sizes, const WriteConfig& config) {
     auto start = std::chrono::steady_clock::now();
 
     auto internal_results =
@@ -1645,8 +1627,8 @@ RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffers,
     const std::vector<std::vector<size_t>>& all_sizes,
-    const ReplicateConfig& config) {
-    if (!client_) {
+    const WriteConfig& config) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -1674,17 +1656,17 @@ RealClient::batch_put_from_multi_buffers_internal(
         }
     }
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, batched_slices, config);
+    return client_service_->BatchPut(keys, batched_slices, config);
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffers,
     const std::vector<std::vector<size_t>>& all_sizes,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node, const ReadRouteConfig& config) {
     auto start = std::chrono::steady_clock::now();
     auto internal_results = batch_get_into_multi_buffers_internal(
-        keys, all_buffers, all_sizes, prefer_alloc_in_same_node);
+        keys, all_buffers, all_sizes, prefer_alloc_in_same_node, config);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -1703,9 +1685,9 @@ RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffers,
     const std::vector<std::vector<size_t>>& all_sizes,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node, const ReadRouteConfig& config) {
     // Validate preconditions
-    if (!client_) {
+    if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -1726,12 +1708,12 @@ RealClient::batch_get_into_multi_buffers_internal(
         return results;
     }
     // Query metadata for all keys
-    const auto query_results = client_->BatchQuery(keys);
+    auto query_results = client_service_->BatchQuery(keys, config);
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;
         size_t original_index;
-        QueryResult query_result;
+        std::unique_ptr<QueryResult> query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
     };
@@ -1751,14 +1733,14 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Validate replica list
-        auto query_result_values = query_results[i].value();
-        if (query_result_values.replicas.empty()) {
+        auto query_result_ptr = std::move(query_results[i].value());
+        if (query_result_ptr->replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
             continue;
         }
         // Calculate required buffer size
-        const auto& replica = query_result_values.replicas[0];
+        const auto& replica = query_result_ptr->replicas[0];
         uint64_t total_size = calculate_total_size(replica);
         const auto& sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
@@ -1786,12 +1768,11 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
 
-        valid_operations.push_back(
-            {.key = key,
-             .original_index = i,
-             .query_result = std::move(query_result_values),
-             .slices = std::move(key_slices),
-             .total_size = total_size});
+        valid_operations.push_back({.key = key,
+                                    .original_index = i,
+                                    .query_result = std::move(query_result_ptr),
+                                    .slices = std::move(key_slices),
+                                    .total_size = total_size});
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
     }
@@ -1802,19 +1783,19 @@ RealClient::batch_get_into_multi_buffers_internal(
 
     // Prepare batch transfer data structures
     std::vector<std::string> batch_keys;
-    std::vector<QueryResult> batch_query_results;
+    std::vector<std::unique_ptr<QueryResult>> batch_query_results;
     std::unordered_map<std::string, std::vector<Slice>> batch_slices;
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
     for (auto& op : valid_operations) {
         batch_keys.push_back(op.key);
-        batch_query_results.push_back(op.query_result);
+        batch_query_results.push_back(std::move(op.query_result));
         batch_slices[op.key] = op.slices;
     }
 
     auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                          prefer_alloc_in_same_node);
+        client_service_->BatchGet(batch_keys, batch_query_results, batch_slices,
+                                  prefer_alloc_in_same_node);
 
     // Process transfer results
     for (size_t j = 0; j < batch_get_results.size(); ++j) {
@@ -1884,8 +1865,10 @@ void RealClient::dummy_client_monitor_func() {
             }
         }
 
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kDummyClientMonitorSleepMs));
+        std::unique_lock<std::mutex> lock(dummy_client_monitor_cv_mutex_);
+        dummy_client_monitor_cv_.wait_for(
+            lock, std::chrono::milliseconds(kDummyClientMonitorSleepMs),
+            [this] { return !dummy_client_monitor_running_.load(); });
     }
 }
 
@@ -1927,6 +1910,18 @@ int RealClient::stop_ipc_server() {
     }
     // jthread will join on destruction or we can explicitly join if needed
     // But recvmsg/accept might block. The logic above attempts to unblock.
+    return 0;
+}
+
+int RealClient::stop_dummy_client_monitor() {
+    {
+        std::lock_guard<std::mutex> lock(dummy_client_monitor_cv_mutex_);
+        dummy_client_monitor_running_ = false;
+    }
+    dummy_client_monitor_cv_.notify_all();
+    if (dummy_client_monitor_thread_.joinable()) {
+        dummy_client_monitor_thread_.join();
+    }
     return 0;
 }
 
@@ -2030,7 +2025,7 @@ void RealClient::ipc_server_func() {
 
 std::vector<Replica::Descriptor> RealClient::get_replica_desc(
     const std::string& key) {
-    auto query_result = client_->Query(key);
+    auto query_result = client_service_->Query(key);
     if (!query_result) {
         std::vector<Replica::Descriptor> replica_list = {};
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -2043,7 +2038,7 @@ std::vector<Replica::Descriptor> RealClient::get_replica_desc(
         return replica_list;
     }
     const std::vector<Replica::Descriptor>& replica_list =
-        query_result.value().replicas;
+        query_result.value()->replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
     }
@@ -2052,7 +2047,7 @@ std::vector<Replica::Descriptor> RealClient::get_replica_desc(
 
 std::map<std::string, std::vector<Replica::Descriptor>>
 RealClient::batch_get_replica_desc(const std::vector<std::string>& keys) {
-    auto query_results = client_->BatchQuery(keys);
+    auto query_results = client_service_->BatchQuery(keys);
     std::map<std::string, std::vector<Replica::Descriptor>> replica_map;
     if (query_results.size() != keys.size()) {
         LOG(ERROR) << "Batch query response size mismatch in "
@@ -2063,7 +2058,7 @@ RealClient::batch_get_replica_desc(const std::vector<std::string>& keys) {
 
     for (size_t i = 0; i < query_results.size(); ++i) {
         if (query_results[i]) {
-            replica_map[keys[i]] = query_results[i].value().replicas;
+            replica_map[keys[i]] = query_results[i].value()->replicas;
         } else {
             LOG(ERROR) << "batch_get_replica failed for key: " << keys[i]
                        << " with error: " << toString(query_results[i].error());

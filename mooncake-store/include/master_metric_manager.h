@@ -140,6 +140,9 @@ class MasterMetricManager {
     void inc_batch_put_revoke_requests(int64_t items);
     void inc_batch_put_revoke_failures(int64_t failed_items);
     void inc_batch_put_revoke_partial_success(int64_t failed_items);
+    void inc_batch_remove_replica_requests(int64_t items);
+    void inc_batch_remove_replica_failures(int64_t failed_items);
+    void inc_batch_remove_replica_partial_success(int64_t failed_items);
 
     // Operation Statistics Getters
     int64_t get_put_start_requests();
@@ -211,6 +214,11 @@ class MasterMetricManager {
     int64_t get_batch_put_revoke_partial_successes();
     int64_t get_batch_put_revoke_items();
     int64_t get_batch_put_revoke_failed_items();
+    int64_t get_batch_remove_replica_requests();
+    int64_t get_batch_remove_replica_failures();
+    int64_t get_batch_remove_replica_partial_successes();
+    int64_t get_batch_remove_replica_items();
+    int64_t get_batch_remove_replica_failed_items();
 
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
@@ -348,6 +356,11 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_put_revoke_partial_successes_;
     ylt::metric::counter_t batch_put_revoke_items_;
     ylt::metric::counter_t batch_put_revoke_failed_items_;
+    ylt::metric::counter_t batch_remove_replica_requests_;
+    ylt::metric::counter_t batch_remove_replica_failures_;
+    ylt::metric::counter_t batch_remove_replica_partial_successes_;
+    ylt::metric::counter_t batch_remove_replica_items_;
+    ylt::metric::counter_t batch_remove_replica_failed_items_;
 
     // cache hit Statistics
     ylt::metric::counter_t mem_cache_hit_nums_;

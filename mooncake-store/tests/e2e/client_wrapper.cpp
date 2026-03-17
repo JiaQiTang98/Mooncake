@@ -8,7 +8,7 @@
 namespace mooncake {
 namespace testing {
 
-ClientTestWrapper::ClientTestWrapper(std::shared_ptr<Client> client,
+ClientTestWrapper::ClientTestWrapper(std::shared_ptr<ClientService> client,
                                      std::shared_ptr<SimpleAllocator> allocator)
     : client_(client), allocator_(allocator) {}
 
@@ -25,9 +25,10 @@ ClientTestWrapper::CreateClientWrapper(const std::string& hostname,
                                        const std::string& device_name,
                                        const std::string& master_server_entry,
                                        size_t local_buffer_size) {
-    auto client_opt =
-        Client::Create(hostname,  // Local hostname
-                       metadata_connstring, protocol, master_server_entry);
+    auto config = ClientConfigBuilder::build_centralized_real_client(
+        hostname, metadata_connstring, protocol, device_name,
+        master_server_entry, 0, local_buffer_size);
+    auto client_opt = ClientService::Create(config);
 
     if (!client_opt.has_value()) {
         return std::nullopt;
@@ -100,7 +101,7 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
     }
 
     const std::vector<Replica::Descriptor>& replica_list =
-        query_result.value().replicas;
+        query_result.value()->replicas;
     if (replica_list.empty()) {
         return ErrorCode::OBJECT_NOT_FOUND;
     }
@@ -112,7 +113,7 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
 
     // Perform get operation
     auto get_result =
-        client_->Get(key, query_result.value(), slice_guard.slices_);
+        client_->Get(key, *query_result.value(), slice_guard.slices_);
     ErrorCode error_code =
         get_result.has_value() ? ErrorCode::OK : get_result.error();
     if (error_code != ErrorCode::OK) {

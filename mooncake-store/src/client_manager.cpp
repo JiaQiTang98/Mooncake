@@ -150,6 +150,15 @@ void ClientManager::SetSegmentRemovalCallback(SegmentRemovalCallback cb) {
 
 auto ClientManager::RegisterClient(const RegisterClientRequest& req)
     -> tl::expected<RegisterClientResponse, ErrorCode> {
+    // Architecture validation: client and master must use the same mode
+    if (req.deployment_mode != GetDeploymentMode()) {
+        LOG(ERROR) << "RegisterClient: architecture mismatch"
+                   << ", client_mode=" << static_cast<int>(req.deployment_mode)
+                   << ", master_mode=" << static_cast<int>(GetDeploymentMode())
+                   << ", client_id=" << req.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
     const auto& client_id = req.client_id;
     auto it = client_metas_.find(client_id);
     if (it != client_metas_.end()) {

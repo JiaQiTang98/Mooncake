@@ -127,11 +127,14 @@ struct LocalDiskReplicaData {
 struct P2PProxyReplicaData {
     P2PProxyReplicaData() = default;
     P2PProxyReplicaData(std::shared_ptr<P2PClientMeta> client,
-                        std::shared_ptr<Segment> segment)
-        : client(std::move(client)), segment(std::move(segment)) {}
+                        std::shared_ptr<Segment> segment, uint64_t object_size)
+        : client(std::move(client)),
+          segment(std::move(segment)),
+          object_size(object_size) {}
 
     std::shared_ptr<const P2PClientMeta> client;
     std::shared_ptr<const Segment> segment;
+    uint64_t object_size = 0;
 };
 
 struct MemoryDescriptor {
@@ -157,7 +160,9 @@ struct P2PProxyDescriptor {
     UUID segment_id;
     std::string ip_address;
     uint16_t rpc_port = 0;
-    YLT_REFL(P2PProxyDescriptor, client_id, segment_id, ip_address, rpc_port);
+    uint64_t object_size = 0;
+    YLT_REFL(P2PProxyDescriptor, client_id, segment_id, ip_address, rpc_port,
+             object_size);
 };
 
 class Replica {
@@ -459,6 +464,9 @@ class Replica {
             }
             throw std::runtime_error("Expected P2PProxyDescriptor");
         }
+
+        friend std::ostream& operator<<(std::ostream& os,
+                                        const Descriptor& desc);
     };
 
    private:

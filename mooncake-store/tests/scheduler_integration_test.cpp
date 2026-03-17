@@ -55,7 +55,7 @@ class SchedulerIntegrationTest : public ::testing::Test {
 
 TEST_F(SchedulerIntegrationTest, TestPromotion) {
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr);
+    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(res.has_value());
 
     // 1. Identify IDs
@@ -126,7 +126,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUCacheThrashing) {
     // 20MB (40 keys * 512KB)
 
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr);
+    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -248,7 +248,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUPromotionBudget) {
     config_["scheduler"]["low_watermark"] = 0.7;
 
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr);
+    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -354,7 +354,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUEviction) {
     config_["scheduler"]["low_watermark"] = 0.7;
 
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr);
+    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -486,7 +486,7 @@ class ConcurrencyTest : public ::testing::Test {
         config["tiers"] = tiers;
 
         backend_ = std::make_unique<TieredBackend>();
-        auto res = backend_->Init(config, nullptr, nullptr);
+        auto res = backend_->Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(res.has_value());
 
         // Identify Tiers
@@ -631,11 +631,10 @@ TEST_F(ConcurrencyTest, CASFailureNoSideEffects) {
 TEST_F(ConcurrencyTest, CASFailureNoCallbackInvoked) {
     // Re-init backend with a counting callback
     std::atomic<int> commit_count{0};
-    MetadataSyncCallback counting_cb =
-        [&commit_count](
-            const std::string&, const UUID&,
-            enum CALLBACK_TYPE type) -> tl::expected<void, ErrorCode> {
-        if (type == COMMIT) commit_count.fetch_add(1);
+    AddReplicaCallback counting_cb =
+        [&commit_count](const std::string&, const UUID&,
+                        size_t) -> tl::expected<void, ErrorCode> {
+        commit_count.fetch_add(1);
         return {};
     };
 
@@ -656,7 +655,8 @@ TEST_F(ConcurrencyTest, CASFailureNoCallbackInvoked) {
     config["tiers"] = tiers;
 
     TieredBackend be;
-    ASSERT_TRUE(be.Init(config, nullptr, counting_cb).has_value());
+    ASSERT_TRUE(
+        be.Init(config, nullptr, counting_cb, nullptr, nullptr).has_value());
 
     auto views = be.GetTierViews();
     UUID fast_id, slow_id;
@@ -690,7 +690,7 @@ TEST_F(ConcurrencyTest, CASFailureNoCallbackInvoked) {
 // Concurrent flush + delete stress test (validates UAF fix)
 TEST_F(SchedulerIntegrationTest, ConcurrentFlushDeleteStress) {
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr);
+    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -752,7 +752,7 @@ TEST_F(SchedulerIntegrationTest, StorageTierCapacityLimit) {
     config["tiers"] = tiers;
 
     TieredBackend backend;
-    auto res = backend.Init(config, nullptr, nullptr);
+    auto res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -824,7 +824,7 @@ TEST_F(SchedulerIntegrationTest, SyncEvictionMode) {
     config["scheduler"] = scheduler;
 
     TieredBackend backend;
-    auto res = backend.Init(config, nullptr, nullptr);
+    auto res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -928,7 +928,7 @@ TEST_F(SchedulerIntegrationTest, SingleTierEviction) {
     config["scheduler"] = scheduler;
 
     TieredBackend backend;
-    auto res = backend.Init(config, nullptr, nullptr);
+    auto res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();

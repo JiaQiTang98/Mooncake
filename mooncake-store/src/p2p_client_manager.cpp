@@ -15,7 +15,7 @@ class CapacityPriorityIterator : public ClientIterator {
         clients_.reserve(client_metas.size());
         for (auto& client : client_metas) {
             if (auto p2p_meta =
-                    std::dynamic_pointer_cast<P2PClientMeta>(client.second)) {
+                    std::static_pointer_cast<P2PClientMeta>(client.second)) {
                 clients_.emplace_back(p2p_meta);
             }
         }
@@ -63,7 +63,7 @@ HeartbeatTaskResult P2PClientManager::ProcessTask(const UUID& client_id,
 
     switch (task.type_) {
         case HeartbeatTaskType::SYNC_SEGMENT_META: {
-            if (auto p2p_meta = std::dynamic_pointer_cast<P2PClientMeta>(
+            if (auto p2p_meta = std::static_pointer_cast<P2PClientMeta>(
                     GetClient(client_id))) {
                 if (const auto* p =
                         std::get_if<SyncSegmentMetaParam>(&task.param_)) {

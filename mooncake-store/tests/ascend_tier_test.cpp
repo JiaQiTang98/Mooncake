@@ -403,7 +403,7 @@ TEST_F(AscendTierTest, TieredBackendAscendTierInit) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr);
+    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
 
     EXPECT_TRUE(result.has_value());
 
@@ -440,7 +440,7 @@ TEST_F(AscendTierTest, TieredBackendMixedTiers) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr);
+    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
 
     EXPECT_TRUE(result.has_value());
 
@@ -479,7 +479,8 @@ TEST_F(AscendTierTest, TieredBackendAllocateOnAscend) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(backend.Init(config, nullptr, nullptr).has_value());
+    ASSERT_TRUE(
+        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
 
     // Allocate
     auto alloc_result = backend.Allocate(SMALL_DATA_SIZE);
@@ -506,7 +507,8 @@ TEST_F(AscendTierTest, TieredBackendWriteToAscend) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(backend.Init(config, nullptr, nullptr).has_value());
+    ASSERT_TRUE(
+        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
 
     // Allocate
     auto alloc_result = backend.Allocate(SMALL_DATA_SIZE);
@@ -541,7 +543,8 @@ TEST_F(AscendTierTest, AscendTierCompleteLifecycle) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(backend.Init(config, nullptr, nullptr).has_value());
+    ASSERT_TRUE(
+        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
 
     const std::string key = "ascend_lifecycle_key";
 
@@ -594,7 +597,8 @@ TEST_F(AscendTierTest, CopyAscendToDramWithVerification) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(backend.Init(config, nullptr, nullptr).has_value());
+    ASSERT_TRUE(
+        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
 
     // 1. Allocate on Ascend tier
     auto alloc_result = backend.Allocate(SMALL_DATA_SIZE);
@@ -629,8 +633,8 @@ TEST_F(AscendTierTest, CopyAscendToDramWithVerification) {
 
     // 4. Copy from Ascend to DRAM using DataCopier (this should invoke
     // CopyAscendToDram)
-    const AscendBuffer* ascend_buf =
-        dynamic_cast<const AscendBuffer*>(ascend_handle->loc.data.buffer.get());
+    const AscendBuffer* ascend_buf = static_pointer_cast<const AscendBuffer*>(
+        ascend_handle->loc.data.buffer.get());
     ASSERT_NE(ascend_buf, nullptr) << "Buffer should be AscendBuffer";
 
     DataSource ascend_source;
@@ -852,7 +856,8 @@ TEST_F(AscendTierTest, CopyBetweenAscendTiersSameDevice) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(backend.Init(config, nullptr, nullptr).has_value());
+    ASSERT_TRUE(
+        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
 
     // Allocate first buffer
     auto alloc_result1 = backend.Allocate(SMALL_DATA_SIZE);
@@ -1011,7 +1016,7 @@ TEST_F(AscendTierTest, AscendTierNotAvailable) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr);
+    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
 
     // Should fail because ASCEND_NPU is not supported
     EXPECT_FALSE(result.has_value());

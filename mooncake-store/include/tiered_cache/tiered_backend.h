@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <memory>
@@ -44,10 +45,10 @@ struct TierView {
 };
 
 /**
- * @enum CALLBACK_TYPE
+ * @enum REMOVE_CALLBACK_TYPE
  * @brief The type of metadata synchronization callback.
  */
-enum CALLBACK_TYPE { COMMIT = 0, DELETE = 1, DELETE_ALL = 2 };
+enum REMOVE_CALLBACK_TYPE { DELETE = 0, DELETE_ALL = 1 };
 
 /**
  * @struct AllocationEntry
@@ -76,12 +77,28 @@ struct AllocationEntry {
 using AllocationHandle = std::shared_ptr<AllocationEntry>;
 
 /**
- * @brief Callback for metadata synchronization.
+ * @brief Callback for metadata synchronization when a replica is added.
  * Invoked after data copy is complete.
  * Returns true if sync succeeds, false otherwise.
  */
-using MetadataSyncCallback = std::function<tl::expected<void, ErrorCode>(
-    const std::string& key, const UUID& tier_id, enum CALLBACK_TYPE type)>;
+using AddReplicaCallback = std::function<tl::expected<void, ErrorCode>(
+    const std::string& key, const UUID& tier_id, size_t size)>;
+
+/**
+ * @brief Callback for metadata synchronization when a replica is removed.
+ * Returns true if sync succeeds, false otherwise.
+ */
+using RemoveReplicaCallback = std::function<tl::expected<void, ErrorCode>(
+    const std::string& key, const UUID& tier_id,
+    enum REMOVE_CALLBACK_TYPE type)>;
+
+/**
+ * @brief Callback for segment lifecycle synchronization.
+ * Invoked when a tier is created (mount=true) or destroyed (mount=false).
+ * The callback should register/unregister the segment with Master.
+ */
+using SegmentSyncCallback = std::function<tl::expected<void, ErrorCode>(
+    const Segment& segment, bool mount)>;
 
 /**
  * @class TieredBackend
@@ -93,8 +110,22 @@ class TieredBackend {
     TieredBackend();
     ~TieredBackend();
 
-    tl::expected<void, ErrorCode> Init(Json::Value root, TransferEngine* engine,
-                                       MetadataSyncCallback sync_callback);
+    /**
+     * @brief 1. stops any backend thread;
+     *        2. all public APIs will return SHUTTING_DOWN.
+     */
+    void Stop();
+
+    /**
+     * @brief Unmounts segments from Master and cleans up resources.
+     */
+    void Destroy();
+
+    tl::expected<void, ErrorCode> Init(
+        Json::Value root, TransferEngine* engine,
+        AddReplicaCallback add_replica_callback,
+        RemoveReplicaCallback remove_replica_callback,
+        SegmentSyncCallback segment_sync_callback);
 
     // --- Client-Centric Operations ---
     // All the following operations are designed for Client-Centric, Client
@@ -135,6 +166,15 @@ class TieredBackend {
         std::optional<uint64_t> expected_version = std::nullopt);
 
     /**
+     * @brief Checks if a key exists in the backend.
+     * @param key The key to check.
+     * @param tier_id Optional tier ID. If specified, checks only the given
+     *        tier; if nullopt, checks any tier.
+     */
+    bool Exist(const std::string& key,
+               std::optional<UUID> tier_id = std::nullopt) const;
+
+    /**
      * @brief Get
      * Returns a handle.
      * @param out_version: If provided, returns the current version of the
@@ -171,6 +211,10 @@ class TieredBackend {
     const DataCopier& GetDataCopier() const;
 
    private:
+    tl::expected<void, ErrorCode> MountSegment(
+        UUID id, size_t capacity, int priority,
+        const std::vector<std::string>& tags, MemoryType memory_type);
+
     struct TierInfo {
         int priority;
         std::vector<std::string> tags;
@@ -195,6 +239,7 @@ class TieredBackend {
     bool AllocateInternalRaw(size_t size, std::optional<UUID> preferred_tier,
                              TieredLocation* out_loc);
 
+   private:
     // Map from tier ID to the actual CacheTier instance.
     std::unordered_map<UUID, std::unique_ptr<CacheTier>> tiers_;
 
@@ -209,11 +254,20 @@ class TieredBackend {
     mutable std::shared_mutex map_mutex_;
 
     std::unique_ptr<DataCopier> data_copier_;
-    // Callback for metadata synchronization with Master
-    MetadataSyncCallback metadata_sync_callback_;
+    // Callbacks for metadata synchronization with Master
+    AddReplicaCallback add_replica_callback_;
+    RemoveReplicaCallback remove_replica_callback_;
+    // Callback for segment lifecycle synchronization with Master
+    SegmentSyncCallback segment_sync_callback_;
 
     // Scheduler
     std::unique_ptr<ClientScheduler> scheduler_;
+
+    // Shutdown flag — once set, all public APIs reject new requests.
+    std::atomic<bool> is_shutting_down_{false};
+
+    // Destroy flag
+    std::atomic<bool> is_destroyed_{false};
 };
 
 }  // namespace mooncake

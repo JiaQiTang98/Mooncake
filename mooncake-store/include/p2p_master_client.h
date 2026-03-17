@@ -34,6 +34,12 @@ class P2PMasterClient final : public MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> RemoveReplica(
         const RemoveReplicaRequest& req);
+
+    /**
+     * @brief Removes replicas from multiple segments in one call
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemoveReplica(
+        const BatchRemoveReplicaRequest& req);
 };
 
 }  // namespace mooncake

@@ -32,7 +32,7 @@ class ClientTestWrapper {
      * @param client The client instance.
      * @param allocator Allocate slice memory for get and put operations.
      */
-    ClientTestWrapper(std::shared_ptr<Client> client,
+    ClientTestWrapper(std::shared_ptr<ClientService> client,
                       std::shared_ptr<SimpleAllocator> allocator);
     ~ClientTestWrapper();
 
@@ -90,7 +90,7 @@ class ClientTestWrapper {
     };
 
     // The client instance.
-    std::shared_ptr<Client> client_;
+    std::shared_ptr<ClientService> client_;
     // The segments that are mounted by the client.
     std::unordered_map<uintptr_t, SegmentInfo> segments_;
     // Manage the memory allocation for get and put operations.

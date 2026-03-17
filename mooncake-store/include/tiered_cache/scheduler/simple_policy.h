@@ -2,7 +2,6 @@
 
 #include "tiered_cache/scheduler/scheduler_policy.h"
 #include <algorithm>
-#include <iostream>
 
 namespace mooncake {
 
@@ -20,7 +19,7 @@ class SimplePolicy : public SchedulerPolicy {
     explicit SimplePolicy(Config config) : config_(config) {}
 
     // Configure which tier is considered "Fast" (Target for promotion)
-    void SetFastTier(UUID id) { fast_tier_id_ = id; }
+    void SetFastTier(UUID id) override { fast_tier_id_ = id; }
 
     std::vector<SchedAction> Decide(
         const std::unordered_map<UUID, TierStats>& tier_stats,

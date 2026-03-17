@@ -70,7 +70,8 @@ class PeerClientTest : public ::testing::Test {
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
         tiered_backend_ = std::make_unique<TieredBackend>();
-        auto init_result = tiered_backend_->Init(config, nullptr, nullptr);
+        auto init_result =
+            tiered_backend_->Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(init_result.has_value())
             << "Failed to initialize TieredBackend: " << init_result.error();
 
@@ -141,10 +142,10 @@ class PeerClientTest : public ::testing::Test {
     }
 
     // Helper: Create a valid RemoteBufferDesc
-    RemoteBufferDesc CreateBufferDesc(const std::string& segment_name,
+    RemoteBufferDesc CreateBufferDesc(const std::string& segment_endpoint,
                                       uintptr_t addr, uint64_t size) {
         RemoteBufferDesc desc;
-        desc.segment_name = segment_name;
+        desc.segment_endpoint = segment_endpoint;
         desc.addr = addr;
         desc.size = size;
         return desc;
@@ -176,7 +177,7 @@ TEST_F(PeerClientTest, ConnectSuccess) {
     // The RPC reaches the server but fails because the key doesn't exist.
     // The important thing is that we get a server-side error, not RPC_FAIL.
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_KEY);
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 // ============================================================================
@@ -192,7 +193,7 @@ TEST_F(PeerClientTest, AsyncReadRemoteDataKeyNotFound) {
     auto result = async_simple::coro::syncAwait(
         peer_client_->AsyncReadRemoteData(request));
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_KEY);
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST_F(PeerClientTest, AsyncReadRemoteDataEmptyKey) {
@@ -247,8 +248,7 @@ TEST_F(PeerClientTest, AsyncReadRemoteDataWithExistingKey) {
     const std::string key = "async_read_key";
     const std::string test_data = "Hello, Async!";
     auto buffer = StringToBuffer(test_data);
-    auto put_result =
-        data_manager_->Put(key, std::move(buffer), test_data.size());
+    auto put_result = data_manager_->Put(key, {buffer.get(), test_data.size()});
     ASSERT_TRUE(put_result.has_value()) << "Put failed";
 
     // Create read request
@@ -359,7 +359,7 @@ TEST_F(PeerClientTest, SyncReadRemoteDataKeyNotFound) {
 
     auto result = peer_client_->ReadRemoteData(request);
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_KEY);
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST_F(PeerClientTest, SyncReadRemoteDataEmptyKey) {
@@ -388,8 +388,7 @@ TEST_F(PeerClientTest, SyncReadRemoteDataWithExistingKey) {
     const std::string key = "sync_read_key";
     const std::string test_data = "Hello, Sync Read!";
     auto buffer = StringToBuffer(test_data);
-    auto put_result =
-        data_manager_->Put(key, std::move(buffer), test_data.size());
+    auto put_result = data_manager_->Put(key, {buffer.get(), test_data.size()});
     ASSERT_TRUE(put_result.has_value()) << "Put failed";
 
     RemoteReadRequest request;

@@ -20,6 +20,11 @@ struct RpcNameTraits<&WrappedP2PMasterService::RemoveReplica> {
     static constexpr const char* value = "RemoveReplica";
 };
 
+template <>
+struct RpcNameTraits<&WrappedP2PMasterService::BatchRemoveReplica> {
+    static constexpr const char* value = "BatchRemoveReplica";
+};
+
 tl::expected<WriteRouteResponse, ErrorCode> P2PMasterClient::GetWriteRoute(
     const WriteRouteRequest& req) {
     ScopedVLogTimer timer(1, "P2PMasterClient::GetWriteRoute");
@@ -51,6 +56,26 @@ tl::expected<void, ErrorCode> P2PMasterClient::RemoveReplica(
         invoke_rpc<&WrappedP2PMasterService::RemoveReplica, void>(req);
     timer.LogResponseExpected(result);
     return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> P2PMasterClient::BatchRemoveReplica(
+    const BatchRemoveReplicaRequest& req) {
+    ScopedVLogTimer timer(1, "P2PMasterClient::BatchRemoveReplica");
+    timer.LogRequest("key=", req.key, "segment_count=", req.segment_ids.size());
+
+    auto result = invoke_rpc<&WrappedP2PMasterService::BatchRemoveReplica,
+                             std::vector<tl::expected<void, ErrorCode>>>(req);
+
+    if (!result) {
+        LOG(ERROR) << "BatchRemoveReplica RPC failed: "
+                   << toString(result.error());
+        std::vector<tl::expected<void, ErrorCode>> fallback;
+        for (size_t i = 0; i < req.segment_ids.size(); i++) {
+            fallback.push_back(tl::make_unexpected(result.error()));
+        }
+        return fallback;
+    }
+    return *result;
 }
 
 }  // namespace mooncake

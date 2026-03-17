@@ -77,7 +77,8 @@ class PeerClientPerfTest : public ::testing::Test {
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
         tiered_backend_ = std::make_unique<TieredBackend>();
-        auto init_result = tiered_backend_->Init(config, nullptr, nullptr);
+        auto init_result =
+            tiered_backend_->Init(config, nullptr, nullptr, nullptr, nullptr);
         ASSERT_TRUE(init_result.has_value())
             << "Failed to initialize TieredBackend: " << init_result.error();
 
@@ -125,7 +126,7 @@ class PeerClientPerfTest : public ::testing::Test {
         RemoteReadRequest request;
         request.key = "perf_key_" + std::to_string(index);
         RemoteBufferDesc desc;
-        desc.segment_name = "perf_segment";
+        desc.segment_endpoint = "perf_segment";
         desc.addr = 0x1000 + index * 0x100;
         desc.size = 64;
         request.dest_buffers.push_back(desc);
@@ -136,7 +137,7 @@ class PeerClientPerfTest : public ::testing::Test {
         RemoteWriteRequest request;
         request.key = "perf_write_key_" + std::to_string(index);
         RemoteBufferDesc desc;
-        desc.segment_name = "perf_segment";
+        desc.segment_endpoint = "perf_segment";
         desc.addr = 0x1000 + index * 0x100;
         desc.size = 64;
         request.src_buffers.push_back(desc);
@@ -524,8 +525,8 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
         tiered_backend_ = std::make_unique<TieredBackend>();
-        auto backend_rc =
-            tiered_backend_->Init(config, transfer_engine_.get(), nullptr);
+        auto backend_rc = tiered_backend_->Init(config, transfer_engine_.get(),
+                                                nullptr, nullptr, nullptr);
         ASSERT_TRUE(backend_rc.has_value())
             << "Failed to initialize TieredBackend";
 
@@ -591,7 +592,7 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
     void PopulateKey(const std::string& key, size_t data_size) {
         auto data = std::make_unique<char[]>(data_size);
         std::memset(data.get(), 'A', data_size);
-        auto rc = data_manager_->Put(key, std::move(data), data_size);
+        auto rc = data_manager_->Put(key, {data.get(), data_size});
         ASSERT_TRUE(rc.has_value()) << "PopulateKey failed for " << key;
     }
 
@@ -599,7 +600,7 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         RemoteReadRequest request;
         request.key = "rdma_perf_key_" + std::to_string(index);
         RemoteBufferDesc desc;
-        desc.segment_name = local_hostname_;
+        desc.segment_endpoint = local_hostname_;
         desc.addr = reinterpret_cast<uintptr_t>(
             static_cast<char*>(rdma_buffer_) + index * data_size);
         desc.size = data_size;
@@ -615,7 +616,7 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         std::memset(src, 'B', data_size);
 
         RemoteBufferDesc desc;
-        desc.segment_name = local_hostname_;
+        desc.segment_endpoint = local_hostname_;
         desc.addr = reinterpret_cast<uintptr_t>(src);
         desc.size = data_size;
         request.src_buffers.push_back(desc);

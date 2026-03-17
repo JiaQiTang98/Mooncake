@@ -24,8 +24,8 @@ struct PyTensorInfo {
     bool valid() const { return tensor_size > 0; }
 };
 
-PyTensorInfo extract_tensor_info(const py::object &tensor,
-                                 const std::string &key_name = "") {
+PyTensorInfo extract_tensor_info(const py::object& tensor,
+                                 const std::string& key_name = "") {
     PyTensorInfo info = {
         0,
         0,
@@ -73,7 +73,7 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
             info.metadata.shape[i] =
                 (i < ndim) ? shape_tuple[i].cast<int64_t>() : -1;
         }
-    } catch (const std::exception &e) {
+    } catch (const std::exception& e) {
         LOG(ERROR) << "Error extracting tensor info: " << e.what();
         return {0, 0, {}};
     }
@@ -81,14 +81,14 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
     return info;
 }
 
-pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
+pybind11::object buffer_to_tensor(BufferHandle* buffer_handle, char* usr_buffer,
                                   int64_t usr_buffer_length) {
     if (!buffer_handle && !usr_buffer) return pybind11::none();
     if (buffer_handle && usr_buffer) return pybind11::none();
 
     bool take_ownership = !!buffer_handle;
     size_t total_length;
-    char *exported_data;
+    char* exported_data;
     if (take_ownership) {
         total_length = buffer_handle->size();
         if (total_length <= sizeof(TensorMetadata)) {
@@ -169,7 +169,7 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         }
         return tensor;
 
-    } catch (const std::exception &e) {
+    } catch (const std::exception& e) {
         LOG(ERROR) << "Failed to convert buffer to tensor: " << e.what();
         if (take_ownership) {
             delete[] exported_data;
@@ -178,15 +178,15 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
     }
 }
 
-std::vector<std::vector<void *>> CastAddrs2Ptrs(
-    const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs) {
-    std::vector<std::vector<void *>> all_buffers;
+std::vector<std::vector<void*>> CastAddrs2Ptrs(
+    const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs) {
+    std::vector<std::vector<void*>> all_buffers;
     all_buffers.reserve(all_buffer_ptrs.size());
-    for (auto &buffer_ptrs : all_buffer_ptrs) {
-        std::vector<void *> ptrs;
+    for (auto& buffer_ptrs : all_buffer_ptrs) {
+        std::vector<void*> ptrs;
         ptrs.reserve(buffer_ptrs.size());
         for (uintptr_t ptr : buffer_ptrs) {
-            ptrs.push_back(reinterpret_cast<void *>(ptr));
+            ptrs.push_back(reinterpret_cast<void*>(ptr));
         }
         all_buffers.emplace_back(std::move(ptrs));
     }
@@ -209,15 +209,29 @@ class MooncakeStorePyWrapper {
 
     bool is_client_initialized() const {
         // Check if the store and client are initialized
-        // Dummy client does not use client_ instance
-        return (store_ && (use_dummy_client_ || store_->client_));
+        // Dummy client does not use client_service_ instance
+        return (store_ && (use_dummy_client_ || store_->client_service_));
     }
 
-    std::string get_tp_key_name(const std::string &base_key, int rank) {
+    std::string get_tp_key_name(const std::string& base_key, int rank) {
         return base_key + "_tp_" + std::to_string(rank);
     }
 
-    pybind11::bytes get(const std::string &key) {
+    WriteConfig get_default_write_config() {
+        if (!store_) {
+            throw std::runtime_error(
+                "call get_default_write_config() but client is not "
+                "initialized");
+        } else if (store_->deployment_mode() == DeploymentMode::P2P) {
+            return WriteRouteRequestConfig{};
+        }
+        return ReplicateConfig{};
+    }
+
+    pybind11::bytes get(
+        const std::string& key,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
+        ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::bytes("\\0", 0);
@@ -228,30 +242,33 @@ class MooncakeStorePyWrapper {
         {
             py::gil_scoped_release release_gil;
             if (use_dummy_client_) {
-                auto [buffer_base, buffer_size] = store_->get_buffer_info(key);
+                auto [buffer_base, buffer_size] =
+                    store_->get_buffer_info(key, config);
                 if (buffer_size == 0) {
                     py::gil_scoped_acquire acquire_gil;
                     return kNullString;
                 }
                 py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes(reinterpret_cast<char *>(buffer_base),
+                return pybind11::bytes(reinterpret_cast<char*>(buffer_base),
                                        buffer_size);
             } else {
-                auto buffer_handle = store_->get_buffer(key);
+                auto buffer_handle = store_->get_buffer(key, config);
                 if (!buffer_handle) {
                     py::gil_scoped_acquire acquire_gil;
                     return kNullString;
                 }
 
                 py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes((char *)buffer_handle->ptr(),
+                return pybind11::bytes((char*)buffer_handle->ptr(),
                                        buffer_handle->size());
             }
         }
     }
 
     std::vector<pybind11::bytes> get_batch(
-        const std::vector<std::string> &keys) {
+        const std::vector<std::string>& keys,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
+        ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
@@ -261,7 +278,7 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            auto batch_data = store_->batch_get_buffer(keys);
+            auto batch_data = store_->batch_get_buffer(keys, config);
             if (batch_data.empty()) {
                 py::gil_scoped_acquire acquire_gil;
                 return {kNullString};
@@ -271,9 +288,9 @@ class MooncakeStorePyWrapper {
             std::vector<pybind11::bytes> results;
             results.reserve(batch_data.size());
 
-            for (const auto &data : batch_data) {
+            for (const auto& data : batch_data) {
                 results.emplace_back(
-                    data ? pybind11::bytes((char *)data->ptr(), data->size())
+                    data ? pybind11::bytes((char*)data->ptr(), data->size())
                          : kNullString);
             }
 
@@ -281,26 +298,32 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    pybind11::object get_tensor_with_tp(const std::string &key, int tp_rank = 0,
-                                        int tp_size = 1, int split_dim = 0) {
-        if (tp_size <= 1) return get_tensor(key);
-        return get_tensor(get_tp_key_name(key, tp_rank));
+    pybind11::object get_tensor_with_tp(
+        const std::string& key, int tp_rank = 0, int tp_size = 1,
+        int split_dim = 0,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
+        if (tp_size <= 1) return get_tensor(key, config_opt);
+        return get_tensor(get_tp_key_name(key, tp_rank), config_opt);
     }
 
     pybind11::list batch_get_tensor_with_tp(
-        const std::vector<std::string> &base_keys, int tp_rank = 0,
-        int tp_size = 1) {
-        if (tp_size <= 1) return batch_get_tensor(base_keys);
+        const std::vector<std::string>& base_keys, int tp_rank = 0,
+        int tp_size = 1,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
+        if (tp_size <= 1) return batch_get_tensor(base_keys, config_opt);
 
         std::vector<std::string> shard_keys;
         shard_keys.reserve(base_keys.size());
-        for (const auto &key : base_keys) {
+        for (const auto& key : base_keys) {
             shard_keys.push_back(get_tp_key_name(key, tp_rank));
         }
-        return batch_get_tensor(shard_keys);
+        return batch_get_tensor(shard_keys, config_opt);
     }
 
-    pybind11::object get_tensor(const std::string &key) {
+    pybind11::object get_tensor(
+        const std::string& key,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
+        ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << "Client not initialized or Dummy client not "
                           "supported for tensors";
@@ -310,13 +333,16 @@ class MooncakeStorePyWrapper {
         std::shared_ptr<BufferHandle> buffer_handle;
         {
             py::gil_scoped_release release_gil;
-            buffer_handle = store_->get_buffer(key);
+            buffer_handle = store_->get_buffer(key, config);
         }
         // Metadata parsing must happen with GIL held
         return buffer_to_tensor(buffer_handle.get(), NULL, 0);
     }
 
-    pybind11::list batch_get_tensor(const std::vector<std::string> &keys) {
+    pybind11::list batch_get_tensor(
+        const std::vector<std::string>& keys,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
+        ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << "Client not initialized or Dummy client not "
                           "supported for tensors";
@@ -328,19 +354,21 @@ class MooncakeStorePyWrapper {
         std::vector<std::shared_ptr<BufferHandle>> buffer_handles;
         {
             py::gil_scoped_release release_gil;
-            buffer_handles = store_->batch_get_buffer(keys);
+            buffer_handles = store_->batch_get_buffer(keys, config);
         }
 
         py::list results_list;
-        for (const auto &handle : buffer_handles) {
+        for (const auto& handle : buffer_handles) {
             results_list.append(buffer_to_tensor(handle.get(), NULL, 0));
         }
         return results_list;
     }
 
-    pybind11::object get_tensor_into(const std::string &key,
-                                     uintptr_t buffer_ptr, size_t size) {
-        char *buffer = reinterpret_cast<char *>(buffer_ptr);
+    pybind11::object get_tensor_into(
+        const std::string& key, uintptr_t buffer_ptr, size_t size,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
+        ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
+        char* buffer = reinterpret_cast<char*>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
@@ -354,20 +382,22 @@ class MooncakeStorePyWrapper {
         int64_t total_length;
         {
             py::gil_scoped_release release_gil;
-            total_length = store_->get_into(key, buffer, size);
+            total_length = store_->get_into(key, buffer, size, config);
         }
 
         return buffer_to_tensor(NULL, buffer, total_length);
     }
 
     pybind11::list batch_get_tensor_into(
-        const std::vector<std::string> &keys,
-        const std::vector<uintptr_t> &buffer_ptrs,
-        const std::vector<size_t> &sizes) {
-        std::vector<void *> buffers;
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& buffer_ptrs,
+        const std::vector<size_t>& sizes,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
+        ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
+        std::vector<void*> buffers;
         buffers.reserve(buffer_ptrs.size());
         for (uintptr_t ptr : buffer_ptrs) {
-            buffers.push_back(reinterpret_cast<void *>(ptr));
+            buffers.push_back(reinterpret_cast<void*>(ptr));
         }
 
         if (!is_client_initialized()) {
@@ -394,7 +424,8 @@ class MooncakeStorePyWrapper {
         {
             py::gil_scoped_release release_gil;
             // This internal call already handles logging for query failures
-            total_lengths = store_->batch_get_into(keys, buffers, sizes);
+            total_lengths =
+                store_->batch_get_into(keys, buffers, sizes, config);
         }
 
         if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
@@ -409,18 +440,18 @@ class MooncakeStorePyWrapper {
 
         py::list results_list;
         for (size_t i = 0; i < total_lengths.size(); i++) {
-            const auto &buffer = buffers[i];
+            const auto& buffer = buffers[i];
             const auto total_length = total_lengths[i];
             results_list.append(buffer_to_tensor(
-                NULL, static_cast<char *>(buffer), total_length));
+                NULL, static_cast<char*>(buffer), total_length));
         }
         return results_list;
     }
 
-    pybind11::object get_tensor_with_tp_into(const std::string &key,
-                                             uintptr_t buffer_ptr, size_t size,
-                                             int tp_rank = 0, int tp_size = 1,
-                                             int split_dim = 0) {
+    pybind11::object get_tensor_with_tp_into(
+        const std::string& key, uintptr_t buffer_ptr, size_t size,
+        int tp_rank = 0, int tp_size = 1, int split_dim = 0,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
@@ -433,20 +464,21 @@ class MooncakeStorePyWrapper {
         }
 
         if (tp_size <= 1) {
-            return get_tensor_into(key, buffer_ptr, size);
+            return get_tensor_into(key, buffer_ptr, size, config_opt);
         }
 
         // Construct the specific key for this rank: e.g., "key_tp_0"
         std::string tp_key = get_tp_key_name(key, tp_rank);
 
         // Delegate to the standard get_tensor_into method
-        return get_tensor_into(tp_key, buffer_ptr, size);
+        return get_tensor_into(tp_key, buffer_ptr, size, config_opt);
     }
 
     pybind11::list batch_get_tensor_with_tp_into(
-        const std::vector<std::string> &base_keys,
-        const std::vector<uintptr_t> &buffer_ptrs,
-        const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1) {
+        const std::vector<std::string>& base_keys,
+        const std::vector<uintptr_t>& buffer_ptrs,
+        const std::vector<size_t>& sizes, int tp_rank = 0, int tp_size = 1,
+        const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             py::list empty_list;
@@ -468,31 +500,33 @@ class MooncakeStorePyWrapper {
 
         // If tp_size is 1, it's just a normal batch_get_tensor_into
         if (tp_size <= 1) {
-            return batch_get_tensor_into(base_keys, buffer_ptrs, sizes);
+            return batch_get_tensor_into(base_keys, buffer_ptrs, sizes,
+                                         config_opt);
         }
 
         // Generate the specific shard keys for the given tp_rank
         std::vector<std::string> shard_keys;
         shard_keys.reserve(base_keys.size());
-        for (const auto &key : base_keys) {
+        for (const auto& key : base_keys) {
             shard_keys.push_back(get_tp_key_name(key, tp_rank));
         }
 
         // Use the existing batch_get_tensor_into to fetch all shards at once
-        return batch_get_tensor_into(shard_keys, buffer_ptrs, sizes);
+        return batch_get_tensor_into(shard_keys, buffer_ptrs, sizes,
+                                     config_opt);
     }
 
-    int put_tensor_impl(const std::string &key, pybind11::object tensor,
-                        const ReplicateConfig &config) {
+    int put_tensor_impl(const std::string& key, pybind11::object tensor,
+                        const WriteConfig& config) {
         // Validation & Metadata extraction (GIL Held)
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
         // Prepare spans
         std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
+        values.emplace_back(reinterpret_cast<const char*>(&info.metadata),
                             sizeof(TensorMetadata));
-        values.emplace_back(reinterpret_cast<const char *>(info.data_ptr),
+        values.emplace_back(reinterpret_cast<const char*>(info.data_ptr),
                             info.tensor_size);
 
         // Store (GIL Released)
@@ -504,17 +538,16 @@ class MooncakeStorePyWrapper {
         return ret;
     }
 
-    int put_tensor(const std::string &key, pybind11::object tensor) {
+    int put_tensor(const std::string& key, pybind11::object tensor) {
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << "Client not initialized or Dummy client not "
                           "supported for tensors";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return put_tensor_impl(key, tensor,
-                               ReplicateConfig{});  // Default config
+        return put_tensor_impl(key, tensor, get_default_write_config());
     }
 
-    int put_tensor_with_tp(const std::string &key, pybind11::object tensor,
+    int put_tensor_with_tp(const std::string& key, pybind11::object tensor,
                            int tp_rank = 0, int tp_size = 1,
                            int split_dim = 0) {
         if (!is_client_initialized() || use_dummy_client_) {
@@ -538,19 +571,20 @@ class MooncakeStorePyWrapper {
                 pybind11::object chunk = chunks[rank].attr("contiguous")();
                 std::string tp_key = get_tp_key_name(key, rank);
 
-                int ret = put_tensor_impl(tp_key, chunk, ReplicateConfig{});
+                int ret =
+                    put_tensor_impl(tp_key, chunk, get_default_write_config());
                 if (ret != 0) return ret;
             }
             return 0;
 
-        } catch (const std::exception &e) {
+        } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to put tensor with tp: " << e.what();
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
     }
 
-    std::vector<int> batch_put_tensor(const std::vector<std::string> &keys,
-                                      const pybind11::list &tensors_list) {
+    std::vector<int> batch_put_tensor(const std::vector<std::string>& keys,
+                                      const pybind11::list& tensors_list) {
         if (!is_client_initialized() || use_dummy_client_)
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
@@ -577,7 +611,7 @@ class MooncakeStorePyWrapper {
 
             // Temporary containers for the batch operation
             std::vector<std::string> valid_keys;
-            std::vector<void *> buffer_ptrs;
+            std::vector<void*> buffer_ptrs;
             std::vector<size_t> buffer_sizes;
             std::vector<size_t> original_indices;  // Map back to results
 
@@ -601,10 +635,10 @@ class MooncakeStorePyWrapper {
                 }
 
                 // Copy Metadata & Data
-                char *dst = static_cast<char *>(alloc_result->ptr());
+                char* dst = static_cast<char*>(alloc_result->ptr());
                 memcpy(dst, &infos[i].metadata, sizeof(TensorMetadata));
                 memcpy(dst + sizeof(TensorMetadata),
-                       reinterpret_cast<void *>(infos[i].data_ptr),
+                       reinterpret_cast<void*>(infos[i].data_ptr),
                        infos[i].tensor_size);
 
                 valid_keys.push_back(keys[i]);
@@ -620,7 +654,8 @@ class MooncakeStorePyWrapper {
 
             if (!valid_keys.empty()) {
                 std::vector<int> op_results = store_->batch_put_from(
-                    valid_keys, buffer_ptrs, buffer_sizes);
+                    valid_keys, buffer_ptrs, buffer_sizes,
+                    get_default_write_config());
                 for (size_t i = 0; i < op_results.size(); ++i) {
                     results[original_indices[i]] = op_results[i];
                 }
@@ -631,8 +666,8 @@ class MooncakeStorePyWrapper {
     }
 
     std::vector<int> batch_put_tensor_with_tp(
-        const std::vector<std::string> &base_keys,
-        const pybind11::list &tensors_list, int tp_rank = 0, int tp_size = 1,
+        const std::vector<std::string>& base_keys,
+        const pybind11::list& tensors_list, int tp_rank = 0, int tp_size = 1,
         int split_dim = 0) {
         if (tp_size <= 1) return batch_put_tensor(base_keys, tensors_list);
         if (!is_client_initialized() || use_dummy_client_)
@@ -695,28 +730,35 @@ class MooncakeStorePyWrapper {
                 }
             }
 
-        } catch (const std::exception &e) {
+        } catch (const std::exception& e) {
             LOG(ERROR) << "Batch put with TP failed: " << e.what();
         }
 
         return final_results;
     }
 
-    int pub_tensor(const std::string &key, pybind11::object tensor,
-                   const ReplicateConfig &config = ReplicateConfig{}) {
-        if (!store_ || !store_->client_) {
+    int pub_tensor(const std::string& key, py::object tensor,
+                   const std::optional<WriteConfig>& config_opt) {
+        WriteConfig config = config_opt.value_or(get_default_write_config());
+        if (!store_ || !store_->client_service_) {
             LOG(ERROR) << "Client is not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-
-        // Validate segment preferences
-        if (!config.preferred_segments.empty() &&
-            config.preferred_segments.size() != config.replica_num) {
-            LOG(ERROR) << "Preferred segments size ("
-                       << config.preferred_segments.size()
-                       << ") must match replica_num (" << config.replica_num
-                       << ")";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        if (store_->deployment_mode() == DeploymentMode::CENTRALIZATION) {
+            // Validate segment preferences
+            if (auto* repl_config = std::get_if<ReplicateConfig>(&config)) {
+                if (!repl_config->preferred_segments.empty() &&
+                    repl_config->preferred_segments.size() !=
+                        repl_config->replica_num) {
+                    LOG(ERROR) << "Preferred segments size ("
+                               << repl_config->preferred_segments.size()
+                               << ") must match replica_num ("
+                               << repl_config->replica_num << ")";
+                    return to_py_ret(ErrorCode::INVALID_PARAMS);
+                }
+            } else {
+                throw std::runtime_error("Invalid config type");
+            }
         }
 
         try {
@@ -764,8 +806,8 @@ class MooncakeStorePyWrapper {
 
             // Section with GIL released
             py::gil_scoped_release release_gil;
-            char *buffer = reinterpret_cast<char *>(data_ptr);
-            char *metadata_buffer = reinterpret_cast<char *>(&metadata);
+            char* buffer = reinterpret_cast<char*>(data_ptr);
+            char* metadata_buffer = reinterpret_cast<char*>(&metadata);
             std::vector<std::span<const char>> values;
             values.emplace_back(
                 std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
@@ -779,7 +821,7 @@ class MooncakeStorePyWrapper {
             }
 
             return 0;
-        } catch (const pybind11::error_already_set &e) {
+        } catch (const pybind11::error_already_set& e) {
             LOG(ERROR) << "Failed to access tensor data: " << e.what();
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
@@ -789,7 +831,7 @@ class MooncakeStorePyWrapper {
 class MooncakeHostMemAllocatorPyWrapper {
    public:
     // Only support ShmHelper for now
-    ShmHelper *shm_helper_ = nullptr;
+    ShmHelper* shm_helper_ = nullptr;
 
     MooncakeHostMemAllocatorPyWrapper() {
         shm_helper_ = ShmHelper::getInstance();
@@ -808,7 +850,36 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
-        .def("__str__", [](const ReplicateConfig &config) {
+        .def("__str__", [](const ReplicateConfig& config) {
+            std::ostringstream oss;
+            oss << config;
+            return oss.str();
+        });
+
+    py::class_<P2PReadRouteConfigExtra>(m, "P2PReadRouteConfigExtra")
+        .def(py::init<>())
+        .def_readwrite("tag_filters", &P2PReadRouteConfigExtra::tag_filters)
+        .def_readwrite("priority_limit",
+                       &P2PReadRouteConfigExtra::priority_limit);
+
+    py::class_<ReadRouteConfig>(m, "ReadRouteConfig")
+        .def(py::init<>())
+        .def(py::init<size_t>(), py::arg("max_candidates"))
+        .def_readwrite("max_candidates", &ReadRouteConfig::max_candidates)
+        .def_readwrite("p2p_config", &ReadRouteConfig::p2p_config);
+
+    py::class_<WriteRouteRequestConfig>(m, "WriteRouteRequestConfig")
+        .def(py::init<>())  // Default constructor
+        .def_readwrite("max_candidates",
+                       &WriteRouteRequestConfig::max_candidates)
+        .def_readwrite("strategy", &WriteRouteRequestConfig::strategy)
+        .def_readwrite("allow_local", &WriteRouteRequestConfig::allow_local)
+        .def_readwrite("prefer_local", &WriteRouteRequestConfig::prefer_local)
+        .def_readwrite("early_return", &WriteRouteRequestConfig::early_return)
+        .def_readwrite("tag_filters", &WriteRouteRequestConfig::tag_filters)
+        .def_readwrite("priority_limit",
+                       &WriteRouteRequestConfig::priority_limit)
+        .def("__str__", [](const WriteRouteRequestConfig& config) {
             std::ostringstream oss;
             oss << config;
             return oss.str();
@@ -841,12 +912,12 @@ PYBIND11_MODULE(store, m) {
                  &Replica::Descriptor::is_disk_replica))
         .def(
             "get_memory_descriptor",
-            static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
+            static_cast<const MemoryDescriptor& (Replica::Descriptor::*)()
                             const>(&Replica::Descriptor::get_memory_descriptor),
             py::return_value_policy::reference_internal)
         .def(
             "get_disk_descriptor",
-            static_cast<const DiskDescriptor &(Replica::Descriptor::*)() const>(
+            static_cast<const DiskDescriptor& (Replica::Descriptor::*)() const>(
                 &Replica::Descriptor::get_disk_descriptor),
             py::return_value_policy::reference_internal);
 
@@ -860,7 +931,7 @@ PYBIND11_MODULE(store, m) {
                        &AllocatedBuffer::Descriptor::buffer_address_)
         .def_readwrite("transport_endpoint",
                        &AllocatedBuffer::Descriptor::transport_endpoint_)
-        .def("__repr__", [](const AllocatedBuffer::Descriptor &desc) {
+        .def("__repr__", [](const AllocatedBuffer::Descriptor& desc) {
             return "<Descriptor size=" + std::to_string(desc.size_) +
                    " buffer_address=" + std::to_string(desc.buffer_address_) +
                    " transport_endpoint=" + desc.transport_endpoint_ + ">";
@@ -870,13 +941,13 @@ PYBIND11_MODULE(store, m) {
     py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
         m, "BufferHandle", py::buffer_protocol())
         .def("ptr",
-             [](const BufferHandle &self) {
+             [](const BufferHandle& self) {
                  // Return the pointer as an integer for Python
                  return reinterpret_cast<uintptr_t>(self.ptr());
              })
         .def("size", &BufferHandle::size)
         .def("__len__", &BufferHandle::size)
-        .def_buffer([](BufferHandle &self) -> py::buffer_info {
+        .def_buffer([](BufferHandle& self) -> py::buffer_info {
             // BufferHandle now always contains contiguous memory
             if (self.size() > 0) {
                 return py::buffer_info(
@@ -907,15 +978,15 @@ PYBIND11_MODULE(store, m) {
     py::class_<MooncakeHostMemAllocatorPyWrapper>(m, "MooncakeHostMemAllocator")
         .def(py::init<>())
         .def("alloc",
-             [](MooncakeHostMemAllocatorPyWrapper &self, size_t size) {
+             [](MooncakeHostMemAllocatorPyWrapper& self, size_t size) {
                  py::gil_scoped_release release;
-                 void *ptr = self.shm_helper_->allocate(size);
+                 void* ptr = self.shm_helper_->allocate(size);
                  return reinterpret_cast<uintptr_t>(ptr);
              })
         .def("free",
-             [](MooncakeHostMemAllocatorPyWrapper &self, uintptr_t ptr) {
+             [](MooncakeHostMemAllocatorPyWrapper& self, uintptr_t ptr) {
                  py::gil_scoped_release release;
-                 return self.shm_helper_->free(reinterpret_cast<void *>(ptr));
+                 return self.shm_helper_->free(reinterpret_cast<void*>(ptr));
              });
 
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
@@ -923,29 +994,82 @@ PYBIND11_MODULE(store, m) {
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def(
-            "setup",
-            [](MooncakeStorePyWrapper &self, const std::string &local_hostname,
-               const std::string &metadata_server,
-               size_t global_segment_size = 1024 * 1024 * 16,
+            "setup_p2p_real_client",
+            [](MooncakeStorePyWrapper& self, const std::string& local_hostname,
+               const std::string& metadata_server,
+               const std::string& tiered_backend_config_json = "",
                size_t local_buffer_size = 1024 * 1024 * 16,
-               const std::string &protocol = "tcp",
-               const std::string &rdma_devices = "",
-               const std::string &master_server_addr = "127.0.0.1:50051",
-               const py::object &engine = py::none()) {
+               const std::string& protocol = "tcp",
+               const std::string& rdma_devices = "",
+               const std::string& master_server_addr = "127.0.0.1:50051",
+               uint16_t client_rpc_port = 12345,
+               uint32_t client_rpc_thread_num = 16,
+               const py::object& engine = py::none()) {
+                auto& resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = false;
-                self.store_ = std::make_shared<RealClient>();
-                ResourceTracker::getInstance().registerInstance(
-                    std::dynamic_pointer_cast<PyClient>(self.store_));
+                auto real_client = std::make_shared<RealClient>();
+                resource_tracker.registerInstance(
+                    std::static_pointer_cast<PyClient>(real_client));
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
                 if (!engine.is_none()) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                return self.store_->setup_real(
-                    local_hostname, metadata_server, global_segment_size,
-                    local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine, "");
+
+                auto config = ClientConfigBuilder::build_p2p_real_client(
+                    local_hostname, metadata_server, protocol,
+                    rdma_devices.empty()
+                        ? std::optional<std::string>(std::nullopt)
+                        : std::optional<std::string>(rdma_devices),
+                    master_server_addr, tiered_backend_config_json,
+                    local_buffer_size, transfer_engine, "", client_rpc_port,
+                    client_rpc_thread_num);
+
+                auto ret = real_client->setup(config);
+                self.store_ = real_client;
+                return ret;
+            },
+            py::arg("local_hostname"), py::arg("metadata_server"),
+            py::arg("tiered_backend_config_json"), py::arg("local_buffer_size"),
+            py::arg("protocol"), py::arg("rdma_devices"),
+            py::arg("master_server_addr"), py::arg("client_rpc_port") = 12345,
+            py::arg("client_rpc_thread_num") = 16,
+            py::arg("engine") = py::none(),
+            "Setup the store in P2P architecture.")
+        .def(
+            "setup",
+            [](MooncakeStorePyWrapper& self, const std::string& local_hostname,
+               const std::string& metadata_server,
+               size_t global_segment_size = 1024 * 1024 * 16,
+               size_t local_buffer_size = 1024 * 1024 * 16,
+               const std::string& protocol = "tcp",
+               const std::string& rdma_devices = "",
+               const std::string& master_server_addr = "127.0.0.1:50051",
+               const py::object& engine = py::none()) {
+                auto& resource_tracker = ResourceTracker::getInstance();
+                self.use_dummy_client_ = false;
+                auto real_client = std::make_shared<RealClient>();
+                resource_tracker.registerInstance(
+                    std::static_pointer_cast<PyClient>(real_client));
+                std::shared_ptr<mooncake::TransferEngine> transfer_engine =
+                    nullptr;
+                if (!engine.is_none()) {
+                    transfer_engine =
+                        engine.cast<std::shared_ptr<TransferEngine>>();
+                }
+                auto config =
+                    ClientConfigBuilder::build_centralized_real_client(
+                        local_hostname, metadata_server, protocol,
+                        rdma_devices.empty()
+                            ? std::optional<std::string>(std::nullopt)
+                            : std::optional<std::string>(rdma_devices),
+                        master_server_addr, global_segment_size,
+                        local_buffer_size, transfer_engine);
+
+                auto ret = real_client->setup(config);
+                self.store_ = real_client;
+                return ret;
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -953,61 +1077,73 @@ PYBIND11_MODULE(store, m) {
             py::arg("master_server_addr"), py::arg("engine") = py::none())
         .def(
             "setup_dummy",
-            [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
-               size_t local_buffer_size, const std::string &server_address) {
+            [](MooncakeStorePyWrapper& self, size_t mem_pool_size,
+               size_t local_buffer_size, const std::string& server_address) {
+                auto& resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
-                self.store_ = std::make_shared<DummyClient>();
-                ResourceTracker::getInstance().registerInstance(
-                    std::dynamic_pointer_cast<PyClient>(self.store_));
+                auto dummy_client = std::make_shared<DummyClient>();
+                resource_tracker.registerInstance(
+                    std::static_pointer_cast<PyClient>(dummy_client));
                 auto [ip, port] = parseHostNameWithPort(server_address);
-                return self.store_->setup_dummy(
+                auto config = ClientConfigBuilder::build_dummy(
                     mem_pool_size, local_buffer_size, server_address,
                     "@mooncake_client_" + std::to_string(port) + ".sock");
+                auto ret = dummy_client->setup(config);
+                self.store_ = dummy_client;
+                return ret;
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
             py::arg("server_address"))
         .def("init_all",
-             [](MooncakeStorePyWrapper &self, const std::string &protocol,
-                const std::string &device_name,
+             [](MooncakeStorePyWrapper& self, const std::string& protocol,
+                const std::string& device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16) {
                  return self.store_->initAll(protocol, device_name,
                                              mount_segment_size);
              })
         .def("alloc_from_mem_pool",
-             [](MooncakeStorePyWrapper &self, size_t size) {
+             [](MooncakeStorePyWrapper& self, size_t size) {
                  py::gil_scoped_release release;
                  return self.store_->alloc_from_mem_pool(size);
              })
-        .def("get", &mooncake::MooncakeStorePyWrapper::get)
-        .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
+        .def("get", &mooncake::MooncakeStorePyWrapper::get, py::arg("key"),
+             py::arg("config") = py::none())
+        .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch,
+             py::arg("keys"), py::arg("config") = py::none())
         .def(
             "get_buffer",
-            [](MooncakeStorePyWrapper &self, const std::string &key) {
+            [](MooncakeStorePyWrapper& self, const std::string& key,
+               const std::optional<ReadRouteConfig>& config_opt) {
+                ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
                 py::gil_scoped_release release;
-                return self.store_->get_buffer(key);
+                return self.store_->get_buffer(key, config);
             },
+            py::arg("key"), py::arg("config") = py::none(),
             py::return_value_policy::take_ownership)
         .def(
             "batch_get_buffer",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::optional<ReadRouteConfig>& config_opt) {
+                ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR) << "batch_get_buffer is not supported for dummy "
                                   "client now";
                     return std::vector<std::shared_ptr<BufferHandle>>{};
                 }
-                return self.store_->batch_get_buffer(keys);
+                return self.store_->batch_get_buffer(keys, config);
             },
+            py::arg("keys"), py::arg("config") = py::none(),
             py::return_value_policy::take_ownership)
         .def("remove",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
+             [](MooncakeStorePyWrapper& self, const std::string& key) {
                  py::gil_scoped_release release;
                  return self.store_->remove(key);
              })
         .def(
             "remove_by_regex",
-            [](MooncakeStorePyWrapper &self, const std::string &str) {
+            [](MooncakeStorePyWrapper& self, const std::string& str) {
                 py::gil_scoped_release release;
                 return self.store_->removeByRegex(str);
             },
@@ -1015,19 +1151,19 @@ PYBIND11_MODULE(store, m) {
             "Removes objects from the store whose keys match the given "
             "regular expression.")
         .def("remove_all",
-             [](MooncakeStorePyWrapper &self) {
+             [](MooncakeStorePyWrapper& self) {
                  py::gil_scoped_release release;
                  return self.store_->removeAll();
              })
         .def("is_exist",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
+             [](MooncakeStorePyWrapper& self, const std::string& key) {
                  py::gil_scoped_release release;
                  return self.store_->isExist(key);
              })
         .def(
             "batch_is_exist",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys) {
                 py::gil_scoped_release release;
                 return self.store_->batchIsExist(keys);
             },
@@ -1035,35 +1171,39 @@ PYBIND11_MODULE(store, m) {
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
         .def("close",
-             [](MooncakeStorePyWrapper &self) {
+             [](MooncakeStorePyWrapper& self) {
                  if (!self.store_) return 0;
+                 py::gil_scoped_release release;
                  int rc = self.store_->tearDownAll();
                  self.store_.reset();
                  return rc;
              })
         .def("get_size",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
+             [](MooncakeStorePyWrapper& self, const std::string& key) {
                  py::gil_scoped_release release;
                  return self.store_->getSize(key);
              })
         .def(
             "get_tensor_with_tp", &MooncakeStorePyWrapper::get_tensor_with_tp,
             py::arg("key"), py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
-            py::arg("split_dim") = 0,
+            py::arg("split_dim") = 0, py::arg("config") = py::none(),
             "Get a PyTorch tensor from the store, optionally sliced for Tensor "
             "Parallelism.\n"
             "Args:\n"
             "  key: The key of the tensor.\n"
             "  tp_rank: The current tensor parallel rank (default 0).\n"
             "  tp_size: The total tensor parallel size (default 1).\n"
-            "  split_dim: The dimension to split the tensor along (default 0).")
+            "  split_dim: The dimension to split the tensor along "
+            "(default 0).\n"
+            "  config: ReadRouteConfig.")
         .def("batch_get_tensor_with_tp",
              &MooncakeStorePyWrapper::batch_get_tensor_with_tp,
              py::arg("base_keys"), py::arg("tp_rank") = 0,
-             py::arg("tp_size") = 1,
+             py::arg("tp_size") = 1, py::arg("config") = py::none(),
              "Get a batch of PyTorch tensor shards from the store for a given "
              "Tensor Parallel rank.")
         .def("get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
+             py::arg("config") = py::none(),
              "Get a PyTorch tensor from the store")
         .def("put_tensor_with_tp", &MooncakeStorePyWrapper::put_tensor_with_tp,
              py::arg("key"), py::arg("tensor"), py::arg("tp_rank") = 0,
@@ -1082,19 +1222,22 @@ PYBIND11_MODULE(store, m) {
         .def("put_tensor", &MooncakeStorePyWrapper::put_tensor, py::arg("key"),
              py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def("batch_get_tensor", &MooncakeStorePyWrapper::batch_get_tensor,
-             py::arg("keys"), "Get a batch of PyTorch tensors from the store")
+             py::arg("keys"), py::arg("config") = py::none(),
+             "Get a batch of PyTorch tensors from the store")
         .def("batch_put_tensor", &MooncakeStorePyWrapper::batch_put_tensor,
              py::arg("keys"), py::arg("tensors_list"),
              "Put a batch of PyTorch tensors into the store")
         .def("pub_tensor", &MooncakeStorePyWrapper::pub_tensor, py::arg("key"),
-             py::arg("tensor"), py::arg("config") = ReplicateConfig{},
+             py::arg("tensor"), py::arg("config") = py::none(),
              "Publish a PyTorch tensor with configurable replication settings")
         .def("get_tensor_into", &MooncakeStorePyWrapper::get_tensor_into,
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+             py::arg("config") = py::none(),
              "Get tensor directly into a pre-allocated buffer")
         .def("batch_get_tensor_into",
              &MooncakeStorePyWrapper::batch_get_tensor_into, py::arg("keys"),
              py::arg("buffer_ptrs"), py::arg("sizes"),
+             py::arg("config") = py::none(),
              "Get tensors directly into pre-allocated buffers for "
              "multiple "
              "keys")
@@ -1103,6 +1246,7 @@ PYBIND11_MODULE(store, m) {
             &MooncakeStorePyWrapper::get_tensor_with_tp_into, py::arg("key"),
             py::arg("buffer_ptr"), py::arg("size"), py::arg("tp_rank") = 0,
             py::arg("tp_size") = 1, py::arg("split_dim") = 0,
+            py::arg("config") = py::none(),
             "Get a PyTorch tensor from the store directly into a pre-allocated "
             "buffer, optionally sliced for Tensor Parallelism.\n"
             "Args:\n"
@@ -1111,20 +1255,23 @@ PYBIND11_MODULE(store, m) {
             "  size: The size of buffer.\n"
             "  tp_rank: The current tensor parallel rank (default 0).\n"
             "  tp_size: The total tensor parallel size (default 1).\n"
-            "  split_dim: The dimension to split the tensor along (default 0).")
+            "  split_dim: The dimension to split the tensor along"
+            "(default 0).\n"
+            "  config: ReadRouteConfig.")
         .def(
             "batch_get_tensor_with_tp_into",
             &MooncakeStorePyWrapper::batch_get_tensor_with_tp_into,
             py::arg("base_keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
             py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+            py::arg("config") = py::none(),
             "Get a batch of PyTorch tensor shards from the store directly into "
             "pre-allocated buffers for a given Tensor Parallel rank.")
         .def(
             "register_buffer",
-            [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
+            [](MooncakeStorePyWrapper& self, uintptr_t buffer_ptr,
                size_t size) {
                 // Register memory buffer for RDMA operations
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
                 py::gil_scoped_release release;
                 return self.store_->register_buffer(buffer, size);
             },
@@ -1132,9 +1279,9 @@ PYBIND11_MODULE(store, m) {
             "Register a memory buffer for direct access operations")
         .def(
             "unregister_buffer",
-            [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr) {
+            [](MooncakeStorePyWrapper& self, uintptr_t buffer_ptr) {
                 // Unregister memory buffer
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
                 py::gil_scoped_release release;
                 return self.store_->unregister_buffer(buffer);
             },
@@ -1143,45 +1290,54 @@ PYBIND11_MODULE(store, m) {
             "buffer for direct access operations")
         .def(
             "get_into",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
-               uintptr_t buffer_ptr, size_t size) {
+            [](MooncakeStorePyWrapper& self, const std::string& key,
+               uintptr_t buffer_ptr, size_t size,
+               const std::optional<ReadRouteConfig>& config_opt) {
+                ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
                 // Get data directly into user-provided buffer
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR) << "get_into is not supported for dummy client "
                                   "now";
                     return (int64_t)-1;
                 }
-                return self.store_->get_into(key, buffer, size);
+                return self.store_->get_into(key, buffer, size, config);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            py::arg("config") = py::none(),
             "Get object data directly into a pre-allocated buffer")
         .def(
             "batch_get_into",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys,
-               const std::vector<uintptr_t> &buffer_ptrs,
-               const std::vector<size_t> &sizes) {
-                std::vector<void *> buffers;
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<uintptr_t>& buffer_ptrs,
+               const std::vector<size_t>& sizes,
+               const std::optional<ReadRouteConfig>& config_opt) {
+                ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
+                std::vector<void*> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
-                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                    buffers.push_back(reinterpret_cast<void*>(ptr));
                 }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_into(keys, buffers, sizes);
+                return self.store_->batch_get_into(keys, buffers, sizes,
+                                                   config);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("config") = py::none(),
             "Get object data directly into pre-allocated buffers for "
             "multiple "
             "keys")
         .def(
             "put_from",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper& self, const std::string& key,
                uintptr_t buffer_ptr, size_t size,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const std::optional<WriteConfig>& config_opt) {
+                WriteConfig config =
+                    config_opt.value_or(self.get_default_write_config());
                 // Put data directly from user-provided buffer
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR) << "put_from is not supported for dummy client "
@@ -1191,19 +1347,21 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->put_from(key, buffer, size, config);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = py::none(),
             "Put object data directly from a pre-allocated buffer")
         .def(
             "put_from_with_metadata",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper& self, const std::string& key,
                uintptr_t buffer_ptr, uintptr_t metadata_buffer_ptr, size_t size,
                size_t metadata_size,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const std::optional<WriteConfig>& config_opt) {
+                WriteConfig config =
+                    config_opt.value_or(self.get_default_write_config());
                 // Put data directly from user-provided buffer with
                 // metadata
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
-                void *metadata_buffer =
-                    reinterpret_cast<void *>(metadata_buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
+                void* metadata_buffer =
+                    reinterpret_cast<void*>(metadata_buffer_ptr);
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR)
@@ -1216,65 +1374,68 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("key"), py::arg("buffer_ptr"),
             py::arg("metadata_buffer_ptr"), py::arg("size"),
-            py::arg("metadata_size"), py::arg("config") = ReplicateConfig{},
+            py::arg("metadata_size"), py::arg("config") = py::none(),
             "Put object data directly from a pre-allocated buffer with "
             "metadata")
         .def(
             "batch_put_from",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys,
-               const std::vector<uintptr_t> &buffer_ptrs,
-               const std::vector<size_t> &sizes,
-               const ReplicateConfig &config = ReplicateConfig{}) {
-                std::vector<void *> buffers;
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<uintptr_t>& buffer_ptrs,
+               const std::vector<size_t>& sizes,
+               const std::optional<WriteConfig>& config_opt) {
+                WriteConfig config =
+                    config_opt.value_or(self.get_default_write_config());
+                std::vector<void*> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
-                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                    buffers.push_back(reinterpret_cast<void*>(ptr));
                 }
                 py::gil_scoped_release release;
                 return self.store_->batch_put_from(keys, buffers, sizes,
                                                    config);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = py::none(),
             "Put object data directly from pre-allocated buffers for "
             "multiple "
             "keys")
         .def(
             "put",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
-               py::buffer buf,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+            [](MooncakeStorePyWrapper& self, const std::string& key,
+               py::buffer buf, const std::optional<WriteConfig>& config_opt) {
+                WriteConfig config =
+                    config_opt.value_or(self.get_default_write_config());
                 py::buffer_info info = buf.request(/*writable=*/false);
                 py::gil_scoped_release release;
                 return self.store_->put(
                     key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
+                    std::span<const char>(static_cast<char*>(info.ptr),
                                           static_cast<size_t>(info.size)),
                     config);
             },
-            py::arg("key"), py::arg("value"),
-            py::arg("config") = ReplicateConfig{})
+            py::arg("key"), py::arg("value"), py::arg("config") = py::none())
         .def(
             "put_parts",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
-               py::args parts,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+            [](MooncakeStorePyWrapper& self, const std::string& key,
+               py::args parts, const std::optional<WriteConfig>& config_opt) {
+                WriteConfig config =
+                    config_opt.value_or(self.get_default_write_config());
                 // 1) Python buffer → span
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
                 infos.reserve(parts.size());
                 spans.reserve(parts.size());
 
-                for (auto &obj : parts) {
+                for (auto& obj : parts) {
                     py::buffer buf = py::reinterpret_borrow<py::buffer>(obj);
                     infos.emplace_back(buf.request(false));
-                    const auto &info = infos.back();
+                    const auto& info = infos.back();
                     if (info.ndim != 1 || info.itemsize != 1)
                         throw std::runtime_error(
                             "parts must be 1-D bytes-like");
 
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
+                    spans.emplace_back(static_cast<const char*>(info.ptr),
                                        static_cast<size_t>(info.size));
                 }
 
@@ -1282,42 +1443,45 @@ PYBIND11_MODULE(store, m) {
                 py::gil_scoped_release unlock;
                 return self.store_->put_parts(key, spans, config);
             },
-            py::arg("key"), py::arg("config") = ReplicateConfig{})
+            py::arg("key"), py::arg("config") = py::none())
         .def(
             "put_batch",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys,
-               const std::vector<py::buffer> &buffers,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<py::buffer>& buffers,
+               const std::optional<WriteConfig>& config_opt) {
+                WriteConfig config =
+                    config_opt.value_or(self.get_default_write_config());
                 // Convert pybuffers to spans without copying
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
                 infos.reserve(buffers.size());
                 spans.reserve(buffers.size());
 
-                for (const auto &buf : buffers) {
+                for (const auto& buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
+                    const auto& info = infos.back();
+                    spans.emplace_back(static_cast<const char*>(info.ptr),
                                        static_cast<size_t>(info.size));
                 }
 
                 py::gil_scoped_release release;
                 return self.store_->put_batch(keys, spans, config);
             },
-            py::arg("keys"), py::arg("values"),
-            py::arg("config") = ReplicateConfig{})
+            py::arg("keys"), py::arg("values"), py::arg("config") = py::none())
         .def("get_hostname",
-             [](MooncakeStorePyWrapper &self) {
+             [](MooncakeStorePyWrapper& self) {
                  return self.store_->get_hostname();
              })
         .def(
             "batch_put_from_multi_buffers",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys,
-               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
-               const std::vector<std::vector<size_t>> &all_sizes,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs,
+               const std::vector<std::vector<size_t>>& all_sizes,
+               const std::optional<WriteConfig>& config_opt) {
+                WriteConfig config =
+                    config_opt.value_or(self.get_default_write_config());
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR)
@@ -1329,17 +1493,20 @@ PYBIND11_MODULE(store, m) {
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
-            py::arg("config") = ReplicateConfig{},
+            py::arg("config") = py::none(),
             "Put object data directly from multiple pre-allocated buffers for "
             "multiple "
             "keys")
         .def(
             "batch_get_into_multi_buffers",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys,
-               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
-               const std::vector<std::vector<size_t>> &all_sizes,
-               bool prefer_alloc_in_same_node = false) {
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs,
+               const std::vector<std::vector<size_t>>& all_sizes,
+               bool prefer_alloc_in_same_node = false,
+               const std::optional<ReadRouteConfig>& config_opt =
+                   std::nullopt) {
+                ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR)
@@ -1349,24 +1516,25 @@ PYBIND11_MODULE(store, m) {
                 }
                 return self.store_->batch_get_into_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
-                    prefer_alloc_in_same_node);
+                    prefer_alloc_in_same_node, config);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("prefer_alloc_in_same_node") = false,
+            py::arg("config") = py::none(),
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")
         .def(
             "get_replica_desc",
-            [](MooncakeStorePyWrapper &self, const std::string &key) {
+            [](MooncakeStorePyWrapper& self, const std::string& key) {
                 py::gil_scoped_release release;
                 return self.store_->get_replica_desc(key);
             },
             py::arg("key"))
         .def(
             "batch_get_replica_desc",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys) {
                 py::gil_scoped_release release;
                 return self.store_->batch_get_replica_desc(keys);
             },

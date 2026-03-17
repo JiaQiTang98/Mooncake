@@ -173,6 +173,9 @@ enum class ErrorCode : int32_t {
     EMPTY_REPLICAS = -1400,
     TIER_NOT_FOUND = -1401,
     DATA_COPY_FAILED = -1402,
+
+    // Store errors (Range: -1500 to -1599)
+    SHUTTING_DOWN = -1500,  ///< Store is shutting down, rejecting new requests.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -186,9 +189,26 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 enum class DeploymentMode {
+    UNKNOWN = -1,
     CENTRALIZATION = 0,
     P2P,
 };
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const DeploymentMode& mode) noexcept {
+    switch (mode) {
+        case DeploymentMode::CENTRALIZATION:
+            os << "CENTRALIZATION";
+            break;
+        case DeploymentMode::P2P:
+            os << "P2P";
+            break;
+        default:
+            os << "UNKNOWN";
+            break;
+    }
+    return os;
+}
 
 /**
  * @brief Represents a contiguous memory region

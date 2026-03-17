@@ -24,13 +24,17 @@ struct GetReplicaListRequestConfig {
     GetReplicaListRequestConfig() = default;
     GetReplicaListRequestConfig(size_t max_c) : max_candidates(max_c) {}
 
-    // 0 means return all viable candidates;
+    // 0 means return all viable replica candidates;
     // otherwise, return at most max_candidates candidates
     static const size_t RETURN_ALL_CANDIDATES = 0;
     size_t max_candidates = RETURN_ALL_CANDIDATES;
     std::optional<P2PGetReplicaListConfigExtra> p2p_config;
 };
 YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config);
+
+// config for filter replicas in read route
+typedef GetReplicaListRequestConfig ReadRouteConfig;
+typedef P2PGetReplicaListConfigExtra P2PReadRouteConfigExtra;
 
 /**
  * @brief Extra info for centralized read route response (Internal use)
@@ -105,11 +109,14 @@ YLT_REFL(HeartbeatResponse, status, view_version, task_results);
 struct RegisterClientRequest {
     UUID client_id;
     std::vector<Segment> segments;
+    DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
+
     // P2P only: network endpoint info
     std::optional<std::string> ip_address;
     std::optional<uint16_t> rpc_port;
 };
-YLT_REFL(RegisterClientRequest, client_id, segments, ip_address, rpc_port);
+YLT_REFL(RegisterClientRequest, client_id, segments, deployment_mode,
+         ip_address, rpc_port);
 
 /**
  * @brief Response structure for RegisterClient operation.

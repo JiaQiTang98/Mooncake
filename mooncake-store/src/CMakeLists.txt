@@ -7,10 +7,13 @@ set(MOONCAKE_STORE_SOURCES
     master_service.cpp
     centralized_master_service.cpp
     client_service.cpp
+    centralized_client_service.cpp
+    p2p_client_service.cpp
     client_metric.cpp
     types.cpp
     master_client.cpp
     centralized_master_client.cpp
+    p2p_master_client.cpp
     utils.cpp
     master_metric_manager.cpp
     storage_backend.cpp

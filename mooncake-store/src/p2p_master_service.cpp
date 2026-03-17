@@ -13,6 +13,7 @@ P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
         config.client_live_ttl_sec, config.client_crashed_ttl_sec,
         config.view_version);
     InitializeClientManager();
+    client_manager_->Start();
 }
 
 std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
@@ -112,7 +113,7 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
         req.config.strategy,
         [&](const std::shared_ptr<ClientMeta>& client)
             -> tl::expected<bool, ErrorCode> {
-            auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+            auto p2p_client = std::static_pointer_cast<P2PClientMeta>(client);
             if (!p2p_client) {
                 LOG(ERROR) << "unexpected client meta type";
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -146,7 +147,7 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
 auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
     -> tl::expected<void, ErrorCode> {
     auto accessor = GetMetadataAccessor(req.key);
-    auto client = std::dynamic_pointer_cast<P2PClientMeta>(
+    auto client = std::static_pointer_cast<P2PClientMeta>(
         client_manager_->GetClient(req.replica.client_id));
     if (!client) {
         LOG(ERROR) << "client not found"
@@ -162,8 +163,9 @@ auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
     }
 
     // Construct Replica from resolved pointers
-    Replica new_replica(P2PProxyReplicaData(client, segment_res.value()),
-                        ReplicaStatus::COMPLETE);
+    Replica new_replica(
+        P2PProxyReplicaData(client, segment_res.value(), req.size),
+        ReplicaStatus::COMPLETE);
 
     if (accessor->Exists()) {
         auto& metadata = accessor->Get();
@@ -225,8 +227,8 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
     auto accessor = GetMetadataAccessor(req.key);
     if (!accessor->Exists()) {
         LOG(WARNING) << "object not found" << ", key: " << req.key
-                     << ", client_id: " << req.replica.client_id
-                     << ", segment_id: " << req.replica.segment_id;
+                     << ", client_id: " << req.client_id
+                     << ", segment_id: " << req.segment_id;
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
@@ -237,15 +239,15 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
          ++it) {
         if (!it->is_p2p_proxy_replica()) {
             LOG(ERROR) << "unexpected replica type" << ", key: " << req.key
-                       << ", client_id: " << req.replica.client_id
-                       << ", segment_id: " << req.replica.segment_id
+                       << ", client_id: " << req.client_id
+                       << ", segment_id: " << req.segment_id
                        << ", replica: " << *it;
             return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
         } else {
             auto seg_id = it->get_segment_id();
             auto cli_id = it->get_p2p_client_id();
-            if (cli_id && seg_id && cli_id == req.replica.client_id &&
-                *seg_id == req.replica.segment_id) {
+            if (cli_id && seg_id && cli_id == req.client_id &&
+                *seg_id == req.segment_id) {
                 RemoveReplicaFromSegmentIndex(accessor->GetShard(), req.key,
                                               *it);
                 OnReplicaRemoved(*it);
@@ -258,8 +260,8 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
 
     if (!removed) {
         LOG(WARNING) << "replica not found" << ", key: " << req.key
-                     << ", client_id: " << req.replica.client_id
-                     << ", segment_id: " << req.replica.segment_id;
+                     << ", client_id: " << req.client_id
+                     << ", segment_id: " << req.segment_id;
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
     } else if (metadata.replicas_.empty()) {
         OnObjectRemoved(metadata);
@@ -267,6 +269,46 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
     }
 
     return {};
+}
+
+auto P2PMasterService::BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
+    -> std::vector<tl::expected<void, ErrorCode>> {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(req.segment_ids.size());
+
+    RemoveReplicaRequest single_req;
+    single_req.key = req.key;
+    single_req.client_id = req.client_id;
+    for (const auto& segment_id : req.segment_ids) {
+        single_req.segment_id = segment_id;
+        auto result = RemoveReplica(single_req);
+        if (!result.has_value()) {
+            if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                // This may happen if the object is removed by another thread
+                LOG(INFO) << "object not found when batch remove replica"
+                          << ", key: " << req.key
+                          << ", client_id: " << req.client_id
+                          << ", segment_id: " << segment_id;
+                results.push_back({});
+            } else if (result.error() == ErrorCode::REPLICA_NOT_FOUND) {
+                // This may happen if the replica is removed by another thread
+                LOG(INFO) << "replica not found when batch remove replica"
+                          << ", key: " << req.key
+                          << ", client_id: " << req.client_id
+                          << ", segment_id: " << segment_id;
+                results.push_back({});
+            } else {
+                LOG(ERROR) << "failed to remove replica" << ", key: " << req.key
+                           << ", client_id: " << req.client_id
+                           << ", segment_id: " << segment_id
+                           << ", error: " << toString(result.error());
+                results.push_back(tl::make_unexpected(result.error()));
+            }
+        } else {
+            results.push_back({});
+        }
+    }
+    return results;
 }
 
 void P2PMasterService::OnObjectAccessed(ObjectMetadata& metadata) {

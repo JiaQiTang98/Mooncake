@@ -14,12 +14,12 @@ namespace mooncake {
  * @brief Describes a remote buffer location for RDMA transfer
  */
 struct RemoteBufferDesc {
-    std::string segment_name;  // Target segment name
-    uintptr_t addr;            // Buffer address
-    uint64_t size;             // Buffer size in bytes
+    std::string segment_endpoint;  // Target segment endpoint
+    uintptr_t addr;                // Buffer address
+    uint64_t size;                 // Buffer size in bytes
 };
 
-YLT_REFL(RemoteBufferDesc, segment_name, addr, size);
+YLT_REFL(RemoteBufferDesc, segment_endpoint, addr, size);
 
 /**
  * @struct RemoteReadRequest

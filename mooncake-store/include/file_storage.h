@@ -1,14 +1,16 @@
 #pragma once
 
-#include "client_service.h"
+#include "centralized_client_service.h"
 #include "client_buffer.hpp"
 #include "storage_backend.h"
 
 namespace mooncake {
 
+class CentralizedClientService;
+
 class FileStorage {
    public:
-    FileStorage(std::shared_ptr<Client> client,
+    FileStorage(std::shared_ptr<CentralizedClientService> client,
                 const std::string& local_rpc_addr,
                 const FileStorageConfig& config);
     ~FileStorage();
@@ -80,7 +82,7 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
-    std::shared_ptr<Client> client_;
+    std::shared_ptr<CentralizedClientService> client_;
     std::string local_rpc_addr_;
     FileStorageConfig config_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;

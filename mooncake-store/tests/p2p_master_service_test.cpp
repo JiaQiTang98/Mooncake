@@ -61,6 +61,7 @@ class P2PMasterServiceTest : public ::testing::Test {
         req.ip_address = ip;
         req.rpc_port = port;
         req.segments = segments;
+        req.deployment_mode = DeploymentMode::P2P;
         auto res = service.RegisterClient(req);
         EXPECT_TRUE(res.has_value())
             << "Failed to register client: " << res.error();
@@ -107,6 +108,7 @@ TEST_F(P2PMasterServiceTest, RegisterClientDuplicate) {
     RegisterClientRequest req;
     req.client_id = client_id;
     req.segments = {MakeP2PSegment("seg2")};
+    req.deployment_mode = DeploymentMode::P2P;
     auto res = service->RegisterClient(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::CLIENT_ALREADY_EXISTS, res.error());
@@ -403,8 +405,8 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaBasic) {
     // Remove the replica
     RemoveReplicaRequest req;
     req.key = "key1";
-    req.replica.client_id = client_id;
-    req.replica.segment_id = seg.id;
+    req.client_id = client_id;
+    req.segment_id = seg.id;
     auto res = service->RemoveReplica(req);
     ASSERT_TRUE(res.has_value());
 
@@ -429,8 +431,8 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaPartial) {
     // Remove one replica
     RemoveReplicaRequest req;
     req.key = "key1";
-    req.replica.client_id = client1;
-    req.replica.segment_id = seg1.id;
+    req.client_id = client1;
+    req.segment_id = seg1.id;
     auto res = service->RemoveReplica(req);
     ASSERT_TRUE(res.has_value());
 
@@ -451,8 +453,8 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaNotFound) {
     // Try removing non-existent replica
     RemoveReplicaRequest req;
     req.key = "key1";
-    req.replica.client_id = client_id;
-    req.replica.segment_id = generate_uuid();  // wrong segment
+    req.client_id = client_id;
+    req.segment_id = generate_uuid();  // wrong segment
     auto res = service->RemoveReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, res.error());
@@ -463,8 +465,8 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaObjectNotFound) {
 
     RemoveReplicaRequest req;
     req.key = "non_existent_key";
-    req.replica.client_id = generate_uuid();
-    req.replica.segment_id = generate_uuid();
+    req.client_id = generate_uuid();
+    req.segment_id = generate_uuid();
     auto res = service->RemoveReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, res.error());
@@ -672,7 +674,8 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     // Step 4: Remove
     RemoveReplicaRequest rm_req;
     rm_req.key = "data_001";
-    rm_req.replica = candidate.replica;
+    rm_req.client_id = candidate.replica.client_id;
+    rm_req.segment_id = candidate.replica.segment_id;
     auto rm_res = service->RemoveReplica(rm_req);
     ASSERT_TRUE(rm_res.has_value());
 

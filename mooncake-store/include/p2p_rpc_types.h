@@ -16,11 +16,11 @@ struct WriteRouteRequestConfig {
     static constexpr size_t RETURN_ALL_CANDIDATES = 0;
     size_t max_candidates = RETURN_ALL_CANDIDATES;
     ObjectIterateStrategy strategy = ObjectIterateStrategy::CAPACITY_PRIORITY;
-    bool allow_local = false;   // whether to filter local client
-    bool prefer_local = false;  // enhance the priority of local client
-                                // works only when allow_local==true
-    bool early_return = true;   // whether to return immediately once candidates
-                                // meet conditions of config
+    bool allow_local = true;   // whether to filter local client
+    bool prefer_local = true;  // enhance the priority of local client
+                               // works only when allow_local==true
+    bool early_return = true;  // whether to return immediately once candidates
+                               // meet conditions of config
 
     // segment level (TODO)
     // filter the segment with tag
@@ -30,6 +30,17 @@ struct WriteRouteRequestConfig {
 };
 YLT_REFL(WriteRouteRequestConfig, max_candidates, strategy, allow_local,
          prefer_local, early_return, tag_filters, priority_limit);
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const WriteRouteRequestConfig& config) {
+    os << "WriteRouteRequestConfig: { max_candidates: " << config.max_candidates
+       << ", strategy: " << config.strategy
+       << ", allow_local: " << (config.allow_local ? "true" : "false")
+       << ", prefer_local: " << (config.prefer_local ? "true" : "false")
+       << ", early_return: " << (config.early_return ? "true" : "false")
+       << ", priority_limit: " << config.priority_limit << " }";
+    return os;
+}
 
 /**
  * @brief Request structure for getting write route.
@@ -75,8 +86,19 @@ YLT_REFL(AddReplicaRequest, key, size, replica);
  */
 struct RemoveReplicaRequest {
     std::string key;
-    P2PProxyDescriptor replica;
+    UUID client_id;
+    UUID segment_id;
 };
-YLT_REFL(RemoveReplicaRequest, key, replica);
+YLT_REFL(RemoveReplicaRequest, key, client_id, segment_id);
+
+/**
+ * @brief Request to remove replicas from multiple segments in one call
+ */
+struct BatchRemoveReplicaRequest {
+    std::string key;
+    UUID client_id;
+    std::vector<UUID> segment_ids;
+};
+YLT_REFL(BatchRemoveReplicaRequest, key, client_id, segment_ids);
 
 }  // namespace mooncake

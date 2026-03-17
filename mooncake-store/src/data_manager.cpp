@@ -36,16 +36,21 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
 }
 
 tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
-                                               std::unique_ptr<char[]> data,
-                                               size_t size,
+                                               const Slice& slice,
                                                std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::Put");
-    timer.LogRequest("key=", key, "size=", size);
+    timer.LogRequest("key=", key, "size=", slice.size);
 
     std::unique_lock lock(GetKeyLock(key));
 
+    if (tiered_backend_->Exist(key)) {
+        LOG(WARNING) << "Key already exists: " << key;
+        timer.LogResponse("error_code=", ErrorCode::REPLICA_ALREADY_EXISTS);
+        return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
+    }
+
     // Allocate space in tiered backend
-    auto handle = tiered_backend_->Allocate(size, tier_id);
+    auto handle = tiered_backend_->Allocate(slice.size, tier_id);
     if (!handle.has_value()) {
         LOG(ERROR) << "Failed to allocate space for key: " << key;
         timer.LogResponse("error_code=", handle.error());
@@ -54,7 +59,7 @@ tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
 
     // Create DataSource from input data
     DataSource source;
-    source.buffer = std::make_unique<TempDRAMBuffer>(std::move(data), size);
+    source.buffer = std::make_unique<RefBuffer>(slice.ptr, slice.size);
     source.type = MemoryType::DRAM;
 
     // Write data to allocated handle
@@ -77,6 +82,13 @@ tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
     return {};
 }
 
+// Attention!!!
+// This method run without key lock.
+// It works based on two assumptions:
+// 1. We assume that each key will not be updated after they are created.
+// 2. The key is acquired by handle which protect the data accessibility based
+//    on ref count. Once the method acquire handle successfully, the accessor
+//    can safely access the data until the handle is released.
 tl::expected<AllocationHandle, ErrorCode> DataManager::Get(
     const std::string& key, std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::Get");
@@ -112,6 +124,17 @@ tl::expected<void, ErrorCode> DataManager::Delete(const std::string& key,
     return {};
 }
 
+std::vector<TierView> DataManager::GetTierViews() const {
+    return tiered_backend_->GetTierViews();
+}
+
+// Attention!!!
+// This method run without key lock.
+// It works based on two assumptions:
+// 1. We assume that each key will not be updated after they are created.
+// 2. The key is acquired by handle which protect the data accessibility based
+//    on ref count. Once the method acquire handle successfully, the accessor
+//    can safely access the data until the handle is released.
 tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
     const std::string& key, const std::vector<RemoteBufferDesc>& dest_buffers) {
     ScopedVLogTimer timer(1, "DataManager::ReadRemoteData");
@@ -139,8 +162,8 @@ tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
     // Calculate total size and validate buffers
     size_t total_size = 0;
     for (const auto& buffer : src_buffers) {
-        if (buffer.segment_name.empty()) {
-            LOG(ERROR) << "WriteData: Empty segment name in source buffers";
+        if (buffer.segment_endpoint.empty()) {
+            LOG(ERROR) << "WriteData: Empty segment endpoint in source buffers";
             timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -154,6 +177,12 @@ tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
     }
 
     std::unique_lock lock(GetKeyLock(key));
+
+    if (tiered_backend_->Exist(key)) {
+        LOG(WARNING) << "Key already exists: " << key;
+        timer.LogResponse("error_code=", ErrorCode::REPLICA_ALREADY_EXISTS);
+        return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
+    }
 
     auto handle_result = tiered_backend_->Allocate(total_size, tier_id);
     if (!handle_result.has_value()) {
@@ -186,6 +215,32 @@ tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
     return {};
 }
 
+// If user attempt to access data in this client by read route
+// and the data is not found,
+// the users will call this function to rectify the route of master
+void DataManager::RectifyReadRoute(const std::string& key,
+                                   std::optional<UUID> tier_id) {
+    if (!rectify_wrong_route_fn_) return;
+
+    std::shared_lock lock(GetKeyLock(key));
+
+    if (!tiered_backend_->Exist(key, tier_id)) {
+        LOG(WARNING) << "RectifyReadRoute: key not found locally"
+                     << (tier_id.has_value()
+                             ? " on tier " +
+                                   std::to_string(tier_id.value().first) + "_" +
+                                   std::to_string(tier_id.value().second)
+                             : "")
+                     << ", removing replica from master for key: " << key;
+        rectify_wrong_route_fn_(key, tier_id);
+    }
+}
+
+void DataManager::SetRectifyCallback(
+    std::function<void(const std::string&, std::optional<UUID>)> fn) {
+    rectify_wrong_route_fn_ = std::move(fn);
+}
+
 tl::expected<void, ErrorCode> DataManager::ValidateRemoteBuffers(
     const std::vector<RemoteBufferDesc>& buffers) {
     if (buffers.empty()) {
@@ -194,8 +249,8 @@ tl::expected<void, ErrorCode> DataManager::ValidateRemoteBuffers(
     }
 
     for (const auto& buffer : buffers) {
-        if (buffer.segment_name.empty()) {
-            LOG(ERROR) << "Empty segment name in buffers";
+        if (buffer.segment_endpoint.empty()) {
+            LOG(ERROR) << "Empty segment endpoint in buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (buffer.addr == 0) {
@@ -334,7 +389,7 @@ tl::expected<void, ErrorCode> DataManager::CopyFromDRAMBuffer(
 }
 
 tl::expected<BatchID, ErrorCode> DataManager::SubmitTransferRequests(
-    const std::string& segment_name, SegmentHandle seg,
+    const std::string& segment_endpoint, SegmentHandle seg,
     const std::vector<TransferRequest>& requests,
     const std::string& function_name) {
     // Allocate batch ID
@@ -359,10 +414,12 @@ tl::expected<BatchID, ErrorCode> DataManager::SubmitTransferRequests(
 tl::expected<void, ErrorCode> DataManager::WaitAllTransferBatches(
     const std::vector<std::tuple<BatchID, size_t, std::string>>& batches) {
     for (size_t i = 0; i < batches.size(); ++i) {
-        const auto& [batch_id, num_tasks, segment_name] = batches[i];
-        auto wait_result = WaitTransferBatch(batch_id, num_tasks, segment_name);
+        const auto& [batch_id, num_tasks, segment_endpoint] = batches[i];
+        auto wait_result =
+            WaitTransferBatch(batch_id, num_tasks, segment_endpoint);
         if (!wait_result.has_value()) {
-            LOG(ERROR) << "Transfer failed for segment '" << segment_name << "'"
+            LOG(ERROR) << "Transfer failed for segment endpoint '"
+                       << segment_endpoint << "'"
                        << ", error: " << toString(wait_result.error())
                        << ", batch_id: " << batch_id << ", index: " << i
                        << ", total_batches: " << batches.size()
@@ -437,10 +494,10 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     }
     auto [transfer_source, temp_buffer] = std::move(buffer_result.value());
 
-    // Group transfers by segment_name
+    // Group transfers by segment_endpoint
     std::unordered_map<std::string, std::vector<size_t>> segment_buffers;
     for (size_t i = 0; i < dest_buffers.size(); ++i) {
-        segment_buffers[dest_buffers[i].segment_name].push_back(i);
+        segment_buffers[dest_buffers[i].segment_endpoint].push_back(i);
     }
 
     // Precompute cumulative offsets
@@ -453,11 +510,12 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 
     // Phase 1: Submit all transfer requests (without waiting)
     std::vector<std::tuple<BatchID, size_t, std::string>> submitted_batches;
-    for (const auto& [segment_name, buffer_indices] : segment_buffers) {
-        SegmentHandle seg = transfer_engine_->openSegment(segment_name);
+    for (const auto& [segment_endpoint, buffer_indices] : segment_buffers) {
+        SegmentHandle seg = transfer_engine_->openSegment(segment_endpoint);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "TransferDataToRemote: Failed to open segment '"
-                       << segment_name << "'";
+            LOG(ERROR)
+                << "TransferDataToRemote: Failed to open segment endpoint '"
+                << segment_endpoint << "'";
             // Cleanup already submitted batches
             for (const auto& [batch_id, _, __] : submitted_batches) {
                 transfer_engine_->freeBatchID(batch_id);
@@ -505,13 +563,13 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
         if (requests.empty()) {
             LOG(WARNING) << "TransferDataToRemote: No transfer requests "
                             "created for segment '"
-                         << segment_name << "', skipping.";
+                         << segment_endpoint << "', skipping.";
             continue;
         }
 
         // Submit transfer requests
-        auto batch_result = SubmitTransferRequests(segment_name, seg, requests,
-                                                   "TransferDataToRemote");
+        auto batch_result = SubmitTransferRequests(
+            segment_endpoint, seg, requests, "TransferDataToRemote");
         if (!batch_result.has_value()) {
             // Cleanup already submitted batches
             for (const auto& [batch_id, _, __] : submitted_batches) {
@@ -521,7 +579,7 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
         }
 
         submitted_batches.emplace_back(batch_result.value(), requests.size(),
-                                       segment_name);
+                                       segment_endpoint);
     }
 
     // Phase 2: Wait for all batches to complete
@@ -597,10 +655,10 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     }
     auto [transfer_dest, temp_buffer] = std::move(buffer_result.value());
 
-    // Group transfers by segment_name
+    // Group transfers by segment_endpoint
     std::unordered_map<std::string, std::vector<size_t>> segment_buffers;
     for (size_t i = 0; i < src_buffers.size(); ++i) {
-        segment_buffers[src_buffers[i].segment_name].push_back(i);
+        segment_buffers[src_buffers[i].segment_endpoint].push_back(i);
     }
 
     // Precompute cumulative offsets
@@ -613,11 +671,12 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
 
     // Phase 1: Submit all transfer requests (without waiting)
     std::vector<std::tuple<BatchID, size_t, std::string>> submitted_batches;
-    for (const auto& [segment_name, buffer_indices] : segment_buffers) {
-        SegmentHandle seg = transfer_engine_->openSegment(segment_name);
+    for (const auto& [segment_endpoint, buffer_indices] : segment_buffers) {
+        SegmentHandle seg = transfer_engine_->openSegment(segment_endpoint);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "TransferDataFromRemote: Failed to open segment '"
-                       << segment_name << "'";
+            LOG(ERROR)
+                << "TransferDataFromRemote: Failed to open segment endpoint '"
+                << segment_endpoint << "'";
             // Cleanup already submitted batches
             for (const auto& [batch_id, _, __] : submitted_batches) {
                 transfer_engine_->freeBatchID(batch_id);
@@ -665,13 +724,13 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
         if (requests.empty()) {
             LOG(WARNING) << "TransferDataFromRemote: No transfer requests "
                             "created for segment '"
-                         << segment_name << "', skipping.";
+                         << segment_endpoint << "', skipping.";
             continue;
         }
 
         // Submit transfer requests
-        auto batch_result = SubmitTransferRequests(segment_name, seg, requests,
-                                                   "TransferDataFromRemote");
+        auto batch_result = SubmitTransferRequests(
+            segment_endpoint, seg, requests, "TransferDataFromRemote");
         if (!batch_result.has_value()) {
             // Cleanup already submitted batches
             for (const auto& [batch_id, _, __] : submitted_batches) {
@@ -681,7 +740,7 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
         }
 
         submitted_batches.emplace_back(batch_result.value(), requests.size(),
-                                       segment_name);
+                                       segment_endpoint);
     }
 
     // Phase 2: Wait for all batches to complete
@@ -713,7 +772,7 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
 }
 
 tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
-    BatchID batch_id, size_t num_tasks, const std::string& segment_name) {
+    BatchID batch_id, size_t num_tasks, const std::string& segment_endpoint) {
     // Poll for completion
     constexpr int64_t timeout_seconds = 10;
     auto start_time = std::chrono::steady_clock::now();
@@ -726,8 +785,8 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
                 .count();
         if (elapsed >= timeout_seconds) {
             LOG(ERROR) << "WaitTransferBatch: Timeout after " << elapsed
-                       << " seconds for batch " << batch_id << " for segment '"
-                       << segment_name << "'";
+                       << " seconds for batch " << batch_id
+                       << " for segment endpoint '" << segment_endpoint << "'";
             transfer_engine_->freeBatchID(batch_id);
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -742,8 +801,8 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
             if (!s.ok()) {
                 LOG(ERROR) << "Failed to get "
                            << "transfer status for task " << i << " for batch "
-                           << batch_id << " for segment '" << segment_name
-                           << "', error: " << s.message();
+                           << batch_id << " for segment endpoint '"
+                           << segment_endpoint << "', error: " << s.message();
                 has_failure = true;
                 break;
             }
@@ -755,7 +814,7 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
                        status.s == TransferStatusEnum::INVALID ||
                        status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(ERROR) << "Transfer task " << i << " for batch " << batch_id
-                           << " for segment '" << segment_name
+                           << " for segment endpoint '" << segment_endpoint
                            << " failed with status "
                            << static_cast<int>(status.s);
                 has_failure = true;
@@ -774,7 +833,7 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
 
         if (all_completed) {
             VLOG(1) << "All transfers completed for batch " << batch_id
-                    << " for segment '" << segment_name << "'";
+                    << " for segment endpoint '" << segment_endpoint << "'";
             break;
         }
 

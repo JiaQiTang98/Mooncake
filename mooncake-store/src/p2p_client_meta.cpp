@@ -112,6 +112,7 @@ auto P2PClientMeta::CollectWriteRouteCandidates(
         candidate.replica.segment_id = seg.id;
         candidate.replica.ip_address = ip_address_;
         candidate.replica.rpc_port = rpc_port_;
+        candidate.replica.object_size = req.size;
 
         candidates.push_back(std::move(candidate));
         if (req.config.early_return &&
