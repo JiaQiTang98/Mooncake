@@ -614,8 +614,11 @@ void MooncakeEpBuffer::update_local_qpns() {
 void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
                                const std::vector<int32_t>& remote_keys,
                                const std::vector<int32_t>& remote_qpns,
-                               const std::vector<int32_t>& remote_lids) {
+                               const std::vector<int32_t>& remote_lids,
+                               const std::vector<int>& active_ranks_mask) {
     for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        int peer_rank = i * num_ranks / MAX_QP_COUNT;
+        if (active_ranks_mask[peer_rank] == 0) continue;
         ibv_ah_attr ah_attr = {
             .dlid = (uint16_t)remote_lids[i],
             .port_num = 0,
@@ -631,6 +634,7 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
         }
     }
     for (int i = 0; i < num_ranks; ++i) {
+        if (active_ranks_mask[i] == 0) continue;
         uint64_t raddr =
             i == rank ? (uint64_t)mr->addr : (uint64_t)remote_addrs[i];
         cudaMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
@@ -645,13 +649,14 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
                                  const std::vector<int32_t>& remote_keys,
                                  const std::vector<int32_t>& remote_qpns,
                                  const std::vector<int64_t>& subnet_prefixes,
-                                 const std::vector<int64_t>& interface_ids) {
+                                 const std::vector<int64_t>& interface_ids,
+                                 const std::vector<int>& active_ranks_mask) {
     for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        int peer_rank = i * num_ranks / MAX_QP_COUNT;
+        if (active_ranks_mask[peer_rank] == 0) continue;
         ibv_gid remote_gid{};
-        remote_gid.global.subnet_prefix =
-            subnet_prefixes[i * num_ranks / MAX_QP_COUNT];
-        remote_gid.global.interface_id =
-            interface_ids[i * num_ranks / MAX_QP_COUNT];
+        remote_gid.global.subnet_prefix = subnet_prefixes[peer_rank];
+        remote_gid.global.interface_id = interface_ids[peer_rank];
         ibv_ah_attr ah_attr = {};
         ah_attr.is_global = 1;
         ah_attr.grh.dgid = remote_gid;
@@ -671,6 +676,7 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
         }
     }
     for (int i = 0; i < num_ranks; ++i) {
+        if (active_ranks_mask[i] == 0) continue;
         uint64_t raddr =
             i == rank ? (uint64_t)mr->addr : (uint64_t)remote_addrs[i];
         cudaMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),

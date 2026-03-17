@@ -172,13 +172,15 @@ struct MooncakeEpBuffer {
     void sync_ib(const std::vector<int64_t>& remote_addrs,
                  const std::vector<int32_t>& remote_keys,
                  const std::vector<int32_t>& remote_qpns,
-                 const std::vector<int32_t>& remote_lids);
+                 const std::vector<int32_t>& remote_lids,
+                 const std::vector<int>& active_ranks_mask);
 
     void sync_roce(const std::vector<int64_t>& remote_addrs,
                    const std::vector<int32_t>& remote_keys,
                    const std::vector<int32_t>& remote_qpns,
                    const std::vector<int64_t>& subnet_prefixes,
-                   const std::vector<int64_t>& interface_ids);
+                   const std::vector<int64_t>& interface_ids,
+                   const std::vector<int>& active_ranks_mask);
 
     std::tuple<int64_t, int32_t> get_mr_info() {
         return {(int64_t)mr->addr, (int32_t)mr->rkey};
