@@ -29,23 +29,43 @@ std::shared_ptr<SegmentManager> P2PClientMeta::GetSegmentManager() {
 
 tl::expected<std::vector<std::string>, ErrorCode> P2PClientMeta::QueryIp(
     const UUID& client_id) {
+    SharedMutexLocker lock(&client_mutex_, shared_lock);
+    auto check_ret = InnerStatusCheck();
+    if (!check_ret.has_value()) {
+        LOG(ERROR) << "fail to inner check client status"
+                   << ", client_id=" << client_id_
+                   << ", ret=" << check_ret.error();
+        return tl::make_unexpected(check_ret.error());
+    }
     return std::vector<std::string>{ip_address_};
 }
 
-void P2PClientMeta::UpdateSegmentUsages(
+SyncSegmentMetaResult P2PClientMeta::UpdateSegmentUsages(
     const std::vector<TierUsageInfo>& usages) {
+    SyncSegmentMetaResult result;
     SpinRWLockLocker lock(&capacity_mutex_);
     for (const auto& usage : usages) {
+        SyncSegmentMetaResult::SubResult sub_res;
+        sub_res.segment_id = usage.segment_id;
+
         auto old_usage =
             segment_manager_->UpdateSegmentUsage(usage.segment_id, usage.usage);
         if (!old_usage.has_value()) {
-            LOG(WARNING)
-                << "fail to update segment usage, segment doesn't exist"
-                << ", segment_id: " << usage.segment_id;
+            LOG(WARNING) << "fail to update segment usage"
+                         << ", client_id: " << client_id_
+                         << ", segment_id: " << usage.segment_id
+                         << ", usage: " << usage.usage
+                         << ", error: " << old_usage.error();
+            sub_res.error = old_usage.error();
+            result.sub_results.push_back(sub_res);
             continue;
         }
+
         client_usage_ = client_usage_ - old_usage.value() + usage.usage;
+        sub_res.error = ErrorCode::OK;
+        result.sub_results.push_back(sub_res);
     }
+    return result;
 }
 
 size_t P2PClientMeta::GetAvailableCapacity() const {
@@ -84,17 +104,16 @@ auto P2PClientMeta::CollectWriteRouteCandidates(
 
         const auto& p2p_extra = seg.GetP2PExtra();
 
-        // exclude segments that contain all tags in tag_filters
-        bool hit_fillter_tag = false;
+        // exclude segments that contain any tags in tag_filters
+        bool hit_filter_tag = false;
         for (const auto& tag : req.config.tag_filters) {
-            if (std::find(p2p_extra.tags.begin(), p2p_extra.tags.end(), tag) ==
+            if (std::find(p2p_extra.tags.begin(), p2p_extra.tags.end(), tag) !=
                 p2p_extra.tags.end()) {
-                hit_fillter_tag = true;
+                hit_filter_tag = true;
                 break;
             }
         }
-        if (hit_fillter_tag)
-            return false;  // hit excluding tag, candidaes are not enough
+        if (hit_filter_tag) return false;  // hit excluding tag, skip segment
 
         if (p2p_extra.priority < req.config.priority_limit)
             return false;  // priority does not enough, candidaes are not enough
