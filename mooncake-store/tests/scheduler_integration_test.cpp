@@ -1,14 +1,178 @@
+#include <algorithm>
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 #include "tiered_cache/tiered_backend.h"
+#include "utils/common.h"
 #include <fstream>
 #include <chrono>
 #include <thread>
 #include <cstring>
 #include <atomic>
+#include "tiered_cache/scheduler/lru_policy.h"
 #include "tiered_cache/tiers/cache_tier.h"  // Ensure TempDRAMBuffer is available
+#include "tiered_cache/scheduler/lru_stats_collector.h"
+#include "tiered_cache/scheduler/simple_policy.h"
+#include "tiered_cache/scheduler/stats_collector.h"
 
 namespace mooncake {
+
+namespace {
+
+const AccessStatEntry* FindKeyStats(const AccessStats& stats,
+                                    const std::string& key) {
+    for (const auto& item : stats.hot_keys) {
+        if (item.key == key) {
+            return &item;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+TEST(SchedulerStatsCollectorTest, SimpleCollectorAggregatesConcurrentAccesses) {
+    constexpr int kThreads = 8;
+    constexpr int kAccessesPerThread = 1000;
+
+    auto now = std::chrono::steady_clock::time_point{};
+    SimpleStatsCollector collector(0.5, 8, detail::DefaultSnapshotLimit(),
+                                   [&now]() { return now; });
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+
+    for (int thread_idx = 0; thread_idx < kThreads; ++thread_idx) {
+        workers.emplace_back([&collector]() {
+            for (int i = 0; i < kAccessesPerThread; ++i) {
+                collector.RecordAccess("hot_key");
+            }
+        });
+    }
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    const auto first_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(first_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* first_stats = FindKeyStats(first_snapshot, "hot_key");
+    ASSERT_NE(first_stats, nullptr);
+    EXPECT_DOUBLE_EQ(first_stats->recent_heat_score,
+                     static_cast<double>(kThreads * kAccessesPerThread));
+
+    const auto second_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(second_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* second_stats = FindKeyStats(second_snapshot, "hot_key");
+    ASSERT_NE(second_stats, nullptr);
+    EXPECT_DOUBLE_EQ(second_stats->recent_heat_score,
+                     static_cast<double>(kThreads * kAccessesPerThread));
+
+    now += std::chrono::seconds(1);
+    const auto third_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(third_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* third_stats = FindKeyStats(third_snapshot, "hot_key");
+    ASSERT_NE(third_stats, nullptr);
+    EXPECT_NEAR(third_stats->recent_heat_score,
+                static_cast<double>(kThreads * kAccessesPerThread) * 0.5, 1e-9);
+}
+
+TEST(SchedulerStatsCollectorTest, SimpleCollectorDecaysByElapsedWallClockTime) {
+    auto now = std::chrono::steady_clock::time_point{};
+    SimpleStatsCollector collector(0.5, 4, detail::DefaultSnapshotLimit(),
+                                   [&now]() { return now; });
+
+    for (int i = 0; i < 8; ++i) {
+        collector.RecordAccess("hot_key");
+    }
+
+    const auto first_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(first_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* first_stats = FindKeyStats(first_snapshot, "hot_key");
+    ASSERT_NE(first_stats, nullptr);
+    EXPECT_DOUBLE_EQ(first_stats->recent_heat_score, 8.0);
+
+    now += std::chrono::seconds(2);
+    const auto second_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(second_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* second_stats = FindKeyStats(second_snapshot, "hot_key");
+    ASSERT_NE(second_stats, nullptr);
+    EXPECT_NEAR(second_stats->recent_heat_score, 2.0, 1e-9);
+}
+
+TEST(SchedulerStatsCollectorTest, SimpleCollectorRemoveKeyDropsHistory) {
+    auto now = std::chrono::steady_clock::time_point{};
+    SimpleStatsCollector collector(0.5, 4, detail::DefaultSnapshotLimit(),
+                                   [&now]() { return now; });
+    collector.RecordAccess("cold_key");
+    collector.RecordAccess("cold_key");
+
+    const auto first_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(first_snapshot.metric, AccessStatMetric::kRecentHeat);
+    ASSERT_NE(FindKeyStats(first_snapshot, "cold_key"), nullptr);
+
+    collector.RemoveKey("cold_key");
+    const auto second_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(FindKeyStats(second_snapshot, "cold_key"), nullptr);
+}
+
+TEST(SchedulerStatsCollectorTest, LRUCollectorTracksGlobalRecency) {
+    LRUStatsCollector collector(4);
+    collector.RecordAccess("key_a");
+    collector.RecordAccess("key_b");
+    collector.RecordAccess("key_a");
+
+    const auto first_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(first_snapshot.metric, AccessStatMetric::kRecencyRank);
+    ASSERT_GE(first_snapshot.hot_keys.size(), 2u);
+    EXPECT_EQ(first_snapshot.hot_keys[0].key, "key_a");
+    EXPECT_EQ(first_snapshot.hot_keys[0].recency_rank, 1u);
+    EXPECT_EQ(first_snapshot.hot_keys[1].key, "key_b");
+    EXPECT_EQ(first_snapshot.hot_keys[1].recency_rank, 2u);
+
+    collector.RecordAccess("key_c");
+    const auto second_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(second_snapshot.metric, AccessStatMetric::kRecencyRank);
+    ASSERT_GE(second_snapshot.hot_keys.size(), 3u);
+    EXPECT_EQ(second_snapshot.hot_keys[0].key, "key_c");
+    EXPECT_EQ(second_snapshot.hot_keys[0].recency_rank, 1u);
+    EXPECT_EQ(second_snapshot.hot_keys[1].key, "key_a");
+    EXPECT_EQ(second_snapshot.hot_keys[1].recency_rank, 2u);
+    EXPECT_EQ(second_snapshot.hot_keys[2].key, "key_b");
+    EXPECT_EQ(second_snapshot.hot_keys[2].recency_rank, 3u);
+
+    collector.RemoveKey("key_a");
+    const auto third_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(FindKeyStats(third_snapshot, "key_a"), nullptr);
+}
+
+TEST(SchedulerPolicyTest, SimplePolicyReturnsErrorWithoutFastTier) {
+    SimplePolicy policy(SimplePolicy::Config{});
+
+    KeyContext key_ctx;
+    key_ctx.key = "hot_key";
+    key_ctx.recent_heat_score = 100.0;
+    key_ctx.current_locations = {UUID{1, 1}};
+    key_ctx.size_bytes = 4096;
+
+    const auto decision = policy.Decide({}, {key_ctx});
+    ASSERT_FALSE(decision.has_value());
+    EXPECT_EQ(decision.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST(SchedulerPolicyTest, LRUPolicyReturnsErrorWhenFastTierStatsMissing) {
+    LRUPolicy policy(LRUPolicy::Config{});
+    const UUID fast_tier{9, 9};
+    policy.SetFastTier(fast_tier);
+
+    KeyContext key_ctx;
+    key_ctx.key = "hot_key";
+    key_ctx.recency_rank = 1;
+    key_ctx.current_locations = {UUID{1, 1}};
+    key_ctx.size_bytes = 4096;
+
+    const auto decision = policy.Decide({}, {key_ctx});
+    ASSERT_FALSE(decision.has_value());
+    EXPECT_EQ(decision.error(), ErrorCode::TIER_NOT_FOUND);
+}
 
 class SchedulerIntegrationTest : public ::testing::Test {
    protected:
@@ -55,7 +219,7 @@ class SchedulerIntegrationTest : public ::testing::Test {
 
 TEST_F(SchedulerIntegrationTest, TestPromotion) {
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     // 1. Identify IDs
@@ -126,7 +290,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUCacheThrashing) {
     // 20MB (40 keys * 512KB)
 
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -248,7 +412,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUPromotionBudget) {
     config_["scheduler"]["low_watermark"] = 0.7;
 
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -352,9 +516,10 @@ TEST_F(SchedulerIntegrationTest, TestLRUEviction) {
     config_["scheduler"]["policy"] = "LRU";
     config_["scheduler"]["high_watermark"] = 0.9;
     config_["scheduler"]["low_watermark"] = 0.7;
+    config_["scheduler"]["stats_snapshot_limit"] = 10;
 
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -462,6 +627,98 @@ TEST_F(SchedulerIntegrationTest, TestLRUEviction) {
     EXPECT_LE(cold_in_dram, expected_cold_in_dram + 1);
 }
 
+TEST_F(SchedulerIntegrationTest, LRUPreCopyEnablesFastReclaimInAsyncMode) {
+    config_["scheduler"]["policy"] = "LRU";
+    config_["scheduler"]["high_watermark"] = 0.9;
+    config_["scheduler"]["low_watermark"] = 0.7;
+    config_["scheduler"]["stats_snapshot_limit"] = 16;
+
+    TieredBackend backend;
+    auto init_res = InitTieredBackendForTest(backend, config_);
+    ASSERT_TRUE(init_res.has_value());
+
+    auto views = backend.GetTierViews();
+    UUID dram_id;
+    UUID storage_id;
+    for (const auto& v : views) {
+        if (v.type == MemoryType::DRAM) dram_id = v.id;
+        if (v.type == MemoryType::NVME) storage_id = v.id;
+    }
+
+    const size_t item_size = 1024 * 1024;
+    for (int i = 0; i < 8; ++i) {
+        std::string key = "precopy_key_" + std::to_string(i);
+        auto handle = backend.Allocate(item_size, dram_id, true);
+        ASSERT_TRUE(handle.has_value());
+
+        auto buffer = std::make_unique<char[]>(item_size);
+        std::memset(buffer.get(), 'P' + i, item_size);
+        DataSource source{
+            std::make_unique<TempDRAMBuffer>(std::move(buffer), item_size),
+            MemoryType::DRAM,
+        };
+
+        ASSERT_TRUE(backend.Write(source, handle.value()).has_value());
+        ASSERT_TRUE(backend.Commit(key, handle.value()).has_value());
+    }
+
+    size_t usage_before_precopy = 0;
+    for (const auto& v : backend.GetTierViews()) {
+        if (v.id == dram_id) {
+            usage_before_precopy = v.usage;
+        }
+    }
+    ASSERT_EQ(usage_before_precopy, item_size * 8);
+
+    for (int round = 0; round < 6; ++round) {
+        for (int i = 0; i < 7; ++i) {
+            ASSERT_TRUE(
+                backend.Get("precopy_key_" + std::to_string(i)).has_value());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    auto has_replica_on = [&](const std::string& key, UUID tier_id) {
+        auto replicas = backend.GetReplicaTierIds(key);
+        return std::find(replicas.begin(), replicas.end(), tier_id) !=
+               replicas.end();
+    };
+
+    const auto precopy_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < precopy_deadline) {
+        if (has_replica_on("precopy_key_7", dram_id) &&
+            has_replica_on("precopy_key_7", storage_id)) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    EXPECT_TRUE(has_replica_on("precopy_key_7", dram_id));
+    EXPECT_TRUE(has_replica_on("precopy_key_7", storage_id))
+        << "cold DRAM key should be pre-copied to storage before eviction";
+
+    size_t usage_after_precopy = 0;
+    for (const auto& v : backend.GetTierViews()) {
+        if (v.id == dram_id) {
+            usage_after_precopy = v.usage;
+        }
+    }
+    EXPECT_EQ(usage_after_precopy, usage_before_precopy)
+        << "pre-copy should not evict the fast-tier replica";
+
+    auto large_alloc = backend.Allocate(item_size * 3, dram_id, true);
+    ASSERT_TRUE(large_alloc.has_value())
+        << "strict allocation should reclaim a pre-copied cold replica even "
+           "when eviction mode is async";
+    EXPECT_EQ(large_alloc.value()->loc.tier->GetTierId(), dram_id);
+
+    EXPECT_FALSE(has_replica_on("precopy_key_7", dram_id))
+        << "fast reclaim should drop the DRAM copy of the cold key";
+    EXPECT_TRUE(has_replica_on("precopy_key_7", storage_id))
+        << "fast reclaim should preserve the prepared storage replica";
+}
+
 class ConcurrencyTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -486,7 +743,7 @@ class ConcurrencyTest : public ::testing::Test {
         config["tiers"] = tiers;
 
         backend_ = std::make_unique<TieredBackend>();
-        auto res = backend_->Init(config, nullptr, nullptr, nullptr, nullptr);
+        auto res = InitTieredBackendForTest(*backend_, config);
         ASSERT_TRUE(res.has_value());
 
         // Identify Tiers
@@ -656,7 +913,7 @@ TEST_F(ConcurrencyTest, CASFailureNoCallbackInvoked) {
 
     TieredBackend be;
     ASSERT_TRUE(
-        be.Init(config, nullptr, counting_cb, nullptr, nullptr).has_value());
+        InitTieredBackendForTest(be, config, nullptr, counting_cb).has_value());
 
     auto views = be.GetTierViews();
     UUID fast_id, slow_id;
@@ -690,7 +947,7 @@ TEST_F(ConcurrencyTest, CASFailureNoCallbackInvoked) {
 // Concurrent flush + delete stress test (validates UAF fix)
 TEST_F(SchedulerIntegrationTest, ConcurrentFlushDeleteStress) {
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -752,7 +1009,7 @@ TEST_F(SchedulerIntegrationTest, StorageTierCapacityLimit) {
     config["tiers"] = tiers;
 
     TieredBackend backend;
-    auto res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -824,7 +1081,7 @@ TEST_F(SchedulerIntegrationTest, SyncEvictionMode) {
     config["scheduler"] = scheduler;
 
     TieredBackend backend;
-    auto res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -884,11 +1141,16 @@ TEST_F(SchedulerIntegrationTest, SyncEvictionMode) {
     ASSERT_TRUE(backend.Write(src6, handle6.value()).has_value());
     ASSERT_TRUE(backend.Commit(key6, handle6.value()).has_value());
 
-    // Verify: at least one key should have been evicted from DRAM
+    // Verify: reclaim planner should free only the requested 1MB, so exactly
+    // one original key leaves DRAM.
     int keys_in_dram = 0;
+    int keys_still_present = 0;
     for (int i = 0; i < 5; i++) {
         std::string key = "sync_key_" + std::to_string(i);
         auto replicas = backend.GetReplicaTierIds(key);
+        if (!replicas.empty()) {
+            keys_still_present++;
+        }
         for (auto tid : replicas) {
             if (tid == dram_id) {
                 keys_in_dram++;
@@ -898,8 +1160,12 @@ TEST_F(SchedulerIntegrationTest, SyncEvictionMode) {
     }
     LOG(INFO) << "Original keys in DRAM after sync eviction: " << keys_in_dram
               << "/5";
-    EXPECT_LT(keys_in_dram, 5)
-        << "At least one key should have been evicted from DRAM";
+    EXPECT_EQ(keys_in_dram, 4)
+        << "Sync reclaim should free only the bytes needed for the failed "
+           "allocation";
+    EXPECT_EQ(keys_still_present, 5)
+        << "Two-tier sync reclaim should migrate cold keys instead of deleting "
+           "them";
 
     LOG(INFO) << "Sync eviction mode test completed";
 }
@@ -928,7 +1194,7 @@ TEST_F(SchedulerIntegrationTest, SingleTierEviction) {
     config["scheduler"] = scheduler;
 
     TieredBackend backend;
-    auto res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
