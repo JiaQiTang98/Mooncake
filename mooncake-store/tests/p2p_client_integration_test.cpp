@@ -110,7 +110,7 @@ TEST_F(P2PClientIntegrationTest, PutAndGetLocal) {
     ASSERT_TRUE(query.has_value())
         << "Query failed: " << static_cast<int>(query.error());
 
-    auto get_result = client_->Get(key, *query.value(), get_slices);
+    auto get_result = client_->Get(key, {(void*)buf.data()}, {buf.size()});
     ASSERT_TRUE(get_result.has_value())
         << "Get failed: " << static_cast<int>(get_result.error());
 
@@ -296,7 +296,7 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
     auto query = client_->Query(key);
     ASSERT_TRUE(query.has_value());
 
-    auto get = client_->Get(key, *query.value(), get_slices);
+    auto get = client_->Get(key, {(void*)buf.data()}, {buf.size()});
     ASSERT_TRUE(get.has_value());
     EXPECT_EQ(std::string(buf.data(), buf.size()), data1);
 }
@@ -375,7 +375,7 @@ TEST_F(P2PClientIntegrationTest, LargePutGet) {
     auto query = client_->Query(key);
     ASSERT_TRUE(query.has_value());
 
-    auto get = client_->Get(key, *query.value(), get_slices);
+    auto get = client_->Get(key, {(void*)read_buf.data()}, {read_buf.size()});
     ASSERT_TRUE(get.has_value())
         << "Large Get failed: " << static_cast<int>(get.error());
 
