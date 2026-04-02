@@ -221,9 +221,9 @@ tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
     req.replica.ip_address = local_ip_;
     if (data_manager_.has_value()) {
         auto tier_views = data_manager_->GetTierViews();
-        auto tier_it =
-            std::find_if(tier_views.begin(), tier_views.end(),
-                         [&](const TierView& view) { return view.id == tier_id; });
+        auto tier_it = std::find_if(
+            tier_views.begin(), tier_views.end(),
+            [&](const TierView& view) { return view.id == tier_id; });
         if (tier_it != tier_views.end()) {
             req.replica.segment_group_id = tier_it->group_id;
         }

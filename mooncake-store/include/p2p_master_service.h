@@ -99,11 +99,10 @@ class P2PMasterService : public MasterService {
     std::optional<size_t> FindGroupReplicaIndex(
         const P2PObjectMetadata& metadata, const UUID& client_id,
         const std::string& group_id) const;
-    auto SelectBestResidentSegment(
-        const std::shared_ptr<P2PClientMeta>& client,
-        const P2PGroupReplicaMeta& group_meta,
-        const P2PGetReplicaListConfigExtra& config) const
-        -> std::shared_ptr<Segment>;
+    auto SelectBestResidentSegment(const std::shared_ptr<P2PClientMeta>& client,
+                                   const P2PGroupReplicaMeta& group_meta,
+                                   const P2PGetReplicaListConfigExtra& config)
+        const -> std::shared_ptr<Segment>;
     static Replica::Descriptor MakeP2PDescriptor(
         const std::shared_ptr<P2PClientMeta>& client,
         const std::shared_ptr<Segment>& segment, size_t object_size);

@@ -133,10 +133,9 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         std::string type = tier_config["type"].asString();
         size_t capacity = tier_config["capacity"].asUInt64();
         int priority = tier_config["priority"].asInt();
-        std::string group_id =
-            tier_config.isMember("segment_group")
-                ? tier_config["segment_group"].asString()
-                : std::string(kDefaultSegmentGroupId);
+        std::string group_id = tier_config.isMember("segment_group")
+                                   ? tier_config["segment_group"].asString()
+                                   : std::string(kDefaultSegmentGroupId);
 
         if (group_id.empty()) {
             LOG(ERROR) << "Tier config has empty 'segment_group'";

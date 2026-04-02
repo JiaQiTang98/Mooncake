@@ -86,7 +86,8 @@ auto P2PMasterService::SelectBestResidentSegment(
         }
 
         if (!best_segment || extra.priority > best_priority ||
-            (extra.priority == best_priority && segment->id < best_segment->id)) {
+            (extra.priority == best_priority &&
+             segment->id < best_segment->id)) {
             best_priority = extra.priority;
             best_segment = std::move(segment);
         }
@@ -143,7 +144,8 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
             continue;
         }
 
-        auto segment = SelectBestResidentSegment(client, group_meta, p2p_config);
+        auto segment =
+            SelectBestResidentSegment(client, group_meta, p2p_config);
         if (!segment) {
             continue;
         }
@@ -278,13 +280,12 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
         std::vector<GroupedCandidate> filtered_candidates;
         filtered_candidates.reserve(grouped_candidates.size());
         for (auto& grouped : grouped_candidates) {
-            auto it = std::find_if(existing_groups.begin(), existing_groups.end(),
-                                   [&](const auto& group_key) {
-                                       return group_key.first ==
-                                                  grouped.client_id &&
-                                              group_key.second ==
-                                                  grouped.group_id;
-                                   });
+            auto it =
+                std::find_if(existing_groups.begin(), existing_groups.end(),
+                             [&](const auto& group_key) {
+                                 return group_key.first == grouped.client_id &&
+                                        group_key.second == grouped.group_id;
+                             });
             if (it != existing_groups.end()) {
                 filtered_candidates.push_back(std::move(grouped));
             }
@@ -372,7 +373,8 @@ auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
         LOG(ERROR) << "segment group mismatch"
                    << ", client_id: " << req.replica.client_id
                    << ", segment_id: " << req.replica.segment_id
-                   << ", request_group_id: " << req.replica.segment_group_id.value()
+                   << ", request_group_id: "
+                   << req.replica.segment_group_id.value()
                    << ", resolved_group_id: " << resolved_group_id;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -478,8 +480,7 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
     //         reverse-index entry.
     bool removed = false;
     for (auto it = p2p_metadata.replicas_.begin();
-         it != p2p_metadata.replicas_.end();
-         ++it) {
+         it != p2p_metadata.replicas_.end(); ++it) {
         if (!it->is_p2p_proxy_replica()) {
             LOG(ERROR) << "unexpected replica type" << ", key: " << req.key
                        << ", client_id: " << req.client_id
@@ -492,8 +493,7 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
             if (cli_id && seg_id && cli_id == req.client_id &&
                 *seg_id == req.segment_id) {
                 RemoveReplicaFromSegmentIndex(accessor->GetShard(),
-                                              accessor->GetKey(),
-                                              *it);
+                                              accessor->GetKey(), *it);
                 OnReplicaRemoved(*it);
                 p2p_metadata.replicas_.erase(it);
                 removed = true;
@@ -526,8 +526,7 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
     }
     if (!updated_group) {
         LOG(WARNING) << "group replica not found when removing physical replica"
-                     << ", key: " << req.key
-                     << ", client_id: " << req.client_id
+                     << ", key: " << req.key << ", client_id: " << req.client_id
                      << ", segment_id: " << req.segment_id;
     }
 
@@ -650,7 +649,8 @@ void P2PMasterService::OnSegmentRemoved(const UUID& segment_id) {
             auto& metadata = AsP2PObjectMetadata(*meta_it->second);
             auto& replicas = metadata.replicas_;
 
-            // Step 2: remove all physical replicas bound to the removed segment.
+            // Step 2: remove all physical replicas bound to the removed
+            // segment.
             for (int k = static_cast<int>(replicas.size()) - 1; k >= 0; --k) {
                 auto id = replicas[k].get_segment_id();
                 if (id.has_value() && id.value() == segment_id) {

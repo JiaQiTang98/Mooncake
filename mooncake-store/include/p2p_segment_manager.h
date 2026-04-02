@@ -58,8 +58,8 @@ class P2PSegmentManager : public SegmentManager {
    private:
     OnSegmentAddedCallback on_segment_added_;
     OnSegmentRemovedCallback on_segment_removed_;
-    std::unordered_map<UUID, std::string, boost::hash<UUID>>
-        segment_to_group_ GUARDED_BY(segment_mutex_);
+    std::unordered_map<UUID, std::string, boost::hash<UUID>> segment_to_group_
+        GUARDED_BY(segment_mutex_);
     std::unordered_map<std::string, P2PSegmentGroup> groups_
         GUARDED_BY(segment_mutex_);
 };

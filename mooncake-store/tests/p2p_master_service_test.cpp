@@ -107,7 +107,8 @@ TEST_F(P2PMasterServiceTest, RegisterClientPreservesSegmentGroup) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
-    auto segment_res = service->GetClientManager().QuerySegment(client_id, seg.id);
+    auto segment_res =
+        service->GetClientManager().QuerySegment(client_id, seg.id);
     ASSERT_TRUE(segment_res.has_value());
     ASSERT_TRUE(segment_res.value()->IsP2PSegment());
     EXPECT_EQ(segment_res.value()->GetP2PExtra().group_id, "hot");
@@ -122,7 +123,8 @@ TEST_F(P2PMasterServiceTest, MountSegmentPreservesDefaultGroup) {
     auto mount_res = service->MountSegment(seg, client_id);
     ASSERT_TRUE(mount_res.has_value());
 
-    auto segment_res = service->GetClientManager().QuerySegment(client_id, seg.id);
+    auto segment_res =
+        service->GetClientManager().QuerySegment(client_id, seg.id);
     ASSERT_TRUE(segment_res.has_value());
     ASSERT_TRUE(segment_res.value()->IsP2PSegment());
     EXPECT_EQ(segment_res.value()->GetP2PExtra().group_id, "default");
@@ -239,9 +241,8 @@ TEST_F(P2PMasterServiceTest, GetWriteRoutePriorityFilter) {
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteCarriesConfiguredGroupId) {
     auto service = CreateService();
-    auto seg_hot =
-        MakeP2PSegment("seg_hot", kDefaultSegmentSize, {}, 10,
-                       MemoryType::DRAM, "hot");
+    auto seg_hot = MakeP2PSegment("seg_hot", kDefaultSegmentSize, {}, 10,
+                                  MemoryType::DRAM, "hot");
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg_hot}, "10.0.0.1", 50051);
 
@@ -372,8 +373,8 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteUsesAvailableCapacityAsTieBreaker) {
     auto seg_large = MakeP2PSegment("seg_large", 2 * 1024 * 1024, {}, 10,
                                     MemoryType::DRAM, "hot");
     auto client_id = generate_uuid();
-    RegisterP2PClient(*service, client_id, {seg_small, seg_large},
-                      "127.0.0.1", 50051);
+    RegisterP2PClient(*service, client_id, {seg_small, seg_large}, "127.0.0.1",
+                      50051);
 
     WriteRouteRequest req;
     req.key = "test_key";
@@ -674,10 +675,10 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaWithinGroupKeepsLogicalReplica) {
     auto before_remove = service->GetReplicaList("key1");
     ASSERT_TRUE(before_remove.has_value());
     ASSERT_EQ(1, before_remove.value().replicas.size());
-    EXPECT_EQ(seg_high.id,
-              before_remove.value().replicas[0]
-                  .get_p2p_proxy_descriptor()
-                  .segment_id);
+    EXPECT_EQ(seg_high.id, before_remove.value()
+                               .replicas[0]
+                               .get_p2p_proxy_descriptor()
+                               .segment_id);
 
     RemoveReplicaRequest req;
     req.key = "key1";
@@ -689,10 +690,9 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaWithinGroupKeepsLogicalReplica) {
     auto after_remove = service->GetReplicaList("key1");
     ASSERT_TRUE(after_remove.has_value());
     ASSERT_EQ(1, after_remove.value().replicas.size());
-    EXPECT_EQ(seg_low.id,
-              after_remove.value().replicas[0]
-                  .get_p2p_proxy_descriptor()
-                  .segment_id);
+    EXPECT_EQ(
+        seg_low.id,
+        after_remove.value().replicas[0].get_p2p_proxy_descriptor().segment_id);
 }
 
 TEST_F(P2PMasterServiceTest, RemoveReplicaObjectNotFound) {
@@ -911,10 +911,10 @@ TEST_F(P2PMasterServiceTest, UnmountSegmentWithinGroupKeepsLogicalReplica) {
     auto after_first_unmount = service->GetReplicaList("key1");
     ASSERT_TRUE(after_first_unmount.has_value());
     ASSERT_EQ(1, after_first_unmount.value().replicas.size());
-    EXPECT_EQ(seg_low.id,
-              after_first_unmount.value().replicas[0]
-                  .get_p2p_proxy_descriptor()
-                  .segment_id);
+    EXPECT_EQ(seg_low.id, after_first_unmount.value()
+                              .replicas[0]
+                              .get_p2p_proxy_descriptor()
+                              .segment_id);
 
     auto unmount_low = service->UnmountSegment(seg_low.id, client_id);
     ASSERT_TRUE(unmount_low.has_value());

@@ -242,10 +242,10 @@ class P2PClientService final : public ClientService {
     /**
      * @brief Get data from local TieredBackend via DataManager.
      */
-    tl::expected<size_t, ErrorCode> GetLocal(const std::string& key,
-                                             std::vector<Slice>& slices,
-                                             std::optional<UUID> tier_id = std::nullopt,
-                                             std::optional<std::string> segment_group_id = std::nullopt);
+    tl::expected<size_t, ErrorCode> GetLocal(
+        const std::string& key, std::vector<Slice>& slices,
+        std::optional<UUID> tier_id = std::nullopt,
+        std::optional<std::string> segment_group_id = std::nullopt);
 
     /**
      * @brief Get data from a remote node via a list of proxy descriptors.

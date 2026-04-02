@@ -49,8 +49,7 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         // Rectify stale route when key/tier route is stale.
         if (result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             result.error() == ErrorCode::TIER_NOT_FOUND) {
-            data_manager_.RectifyReadRoute(request.key,
-                                           request.target_tier_id);
+            data_manager_.RectifyReadRoute(request.key, request.target_tier_id);
         }
         return result;
     }

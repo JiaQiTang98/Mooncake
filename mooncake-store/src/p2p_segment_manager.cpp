@@ -49,24 +49,23 @@ tl::expected<void, ErrorCode> P2PSegmentManager::InnerMountSegment(
         group.group_id = group_id;
     }
     group.ordered_segments.push_back(new_segment->id);
-    std::sort(group.ordered_segments.begin(), group.ordered_segments.end(),
-              [this](const UUID& lhs, const UUID& rhs) {
-                  const auto lhs_it = mounted_segments_.find(lhs);
-                  const auto rhs_it = mounted_segments_.find(rhs);
-                  if (lhs_it == mounted_segments_.end() ||
-                      rhs_it == mounted_segments_.end()) {
-                      return lhs < rhs;
-                  }
+    std::sort(
+        group.ordered_segments.begin(), group.ordered_segments.end(),
+        [this](const UUID& lhs, const UUID& rhs) {
+            const auto lhs_it = mounted_segments_.find(lhs);
+            const auto rhs_it = mounted_segments_.find(rhs);
+            if (lhs_it == mounted_segments_.end() ||
+                rhs_it == mounted_segments_.end()) {
+                return lhs < rhs;
+            }
 
-                  const auto lhs_priority =
-                      lhs_it->second->GetP2PExtra().priority;
-                  const auto rhs_priority =
-                      rhs_it->second->GetP2PExtra().priority;
-                  if (lhs_priority != rhs_priority) {
-                      return lhs_priority > rhs_priority;
-                  }
-                  return lhs < rhs;
-              });
+            const auto lhs_priority = lhs_it->second->GetP2PExtra().priority;
+            const auto rhs_priority = rhs_it->second->GetP2PExtra().priority;
+            if (lhs_priority != rhs_priority) {
+                return lhs_priority > rhs_priority;
+            }
+            return lhs < rhs;
+        });
 
     // Step 3: notify capacity/accounting callbacks.
     if (on_segment_added_) {

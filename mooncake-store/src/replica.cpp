@@ -86,10 +86,10 @@ std::ostream& operator<<(std::ostream& os, const Replica::Descriptor& desc) {
                    << ", endpoint: " << d.transport_endpoint;
             } else if constexpr (std::is_same_v<T, P2PProxyDescriptor>) {
                 os << "type: P2P_PROXY, client: " << d.client_id
-                   << ", segment: " << d.segment_id
-                   << ", group: "
-                   << (d.segment_group_id.has_value() ? d.segment_group_id.value()
-                                                      : "N/A")
+                   << ", segment: " << d.segment_id << ", group: "
+                   << (d.segment_group_id.has_value()
+                           ? d.segment_group_id.value()
+                           : "N/A")
                    << ", endpoint: " << d.ip_address << ":" << d.rpc_port
                    << ", size: " << d.object_size;
             }

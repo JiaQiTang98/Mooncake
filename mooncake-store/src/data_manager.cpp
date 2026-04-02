@@ -97,8 +97,8 @@ tl::expected<AllocationHandle, ErrorCode> DataManager::Get(
     ScopedVLogTimer timer(1, "DataManager::Get");
     timer.LogRequest("key=", key);
 
-    tl::expected<AllocationHandle, ErrorCode> handle = tl::make_unexpected(
-        ErrorCode::INTERNAL_ERROR);
+    tl::expected<AllocationHandle, ErrorCode> handle =
+        tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     if (segment_group_id.has_value() && !segment_group_id->empty()) {
         handle = GetFromSegmentGroup(key, *segment_group_id, tier_id);
     } else {
@@ -163,9 +163,8 @@ tl::expected<AllocationHandle, ErrorCode> DataManager::GetFromSegmentGroup(
     AllocationHandle hit_handle;
     for (const auto& [priority, tier] : group_tiers) {
         (void)priority;
-        auto probe = tiered_backend_->Get(
-            key, tier,
-            /*record_access=*/false);
+        auto probe = tiered_backend_->Get(key, tier,
+                                          /*record_access=*/false);
         if (probe.has_value()) {
             hit_tier_id = tier;
             hit_handle = probe.value();
@@ -190,9 +189,8 @@ tl::expected<AllocationHandle, ErrorCode> DataManager::GetFromSegmentGroup(
 
     // Step 3: record access only once on the final hit tier to preserve
     // existing "read warms data" semantics.
-    auto final = tiered_backend_->Get(
-        key, *hit_tier_id,
-        /*record_access=*/true);
+    auto final = tiered_backend_->Get(key, *hit_tier_id,
+                                      /*record_access=*/true);
     if (final.has_value()) {
         return final.value();
     }
@@ -239,8 +237,7 @@ std::vector<TierView> DataManager::GetTierViews() const {
 //    can safely access the data until the handle is released.
 tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
     const std::string& key, const std::vector<RemoteBufferDesc>& dest_buffers,
-    std::optional<UUID> tier_id,
-    std::optional<std::string> segment_group_id) {
+    std::optional<UUID> tier_id, std::optional<std::string> segment_group_id) {
     ScopedVLogTimer timer(1, "DataManager::ReadRemoteData");
     timer.LogRequest("key=", key, "buffer_count=", dest_buffers.size());
 
