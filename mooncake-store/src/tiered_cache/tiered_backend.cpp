@@ -20,8 +20,8 @@ constexpr std::string_view kDefaultSegmentGroupId = "default";
 }
 
 AllocationEntry::~AllocationEntry() {
-    if (backend && loc.tier) {
-        // When ref count drops to 0, free physical resource directly.
+    if (loc.tier) {
+        // Keep the tier alive until the final handle has released the buffer.
         loc.tier->Free(std::move(loc.data));
     }
 }
@@ -195,7 +195,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
                               ? ", numa_node=" + std::to_string(*numa_node)
                               : "");
 
-            auto tier = std::make_unique<DramCacheTier>(
+            auto tier = std::make_shared<DramCacheTier>(
                 id, capacity, tags, numa_node, allocator_type);
             auto init_result = tier->Init(this, engine);
             if (!init_result) {
@@ -222,7 +222,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
                       << ", group_id=" << group_id
                       << ", device_id=" << device_id;
 
-            auto tier = std::make_unique<AscendCacheTier>(id, capacity, tags,
+            auto tier = std::make_shared<AscendCacheTier>(id, capacity, tags,
                                                           device_id);
             auto init_result = tier->Init(this, engine);
             if (!init_result) {
@@ -241,7 +241,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             LOG(INFO) << "Creating Storage tier: id=" << id
                       << ", capacity=" << capacity << ", priority=" << priority
                       << ", group_id=" << group_id;
-            auto tier = std::make_unique<StorageTier>(id, tags, capacity);
+            auto tier = std::make_shared<StorageTier>(id, tags, capacity);
             auto init_result = tier->Init(this, engine);
             if (!init_result) {
                 LOG(ERROR) << "Failed to initialize Storage tier: id=" << id
@@ -317,10 +317,19 @@ tl::expected<void, ErrorCode> TieredBackend::MountSegment(
     return {};
 }
 
-bool TieredBackend::AllocateInternalRaw(size_t size,
-                                        std::optional<UUID> preferred_tier,
-                                        TieredLocation* out_loc) {
-    if (!out_loc) return false;
+tl::expected<void, ErrorCode> TieredBackend::AllocateInternalRaw(
+    size_t size, std::optional<UUID> preferred_tier, TieredLocation* out_loc) {
+    if (!out_loc) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ErrorCode last_error = ErrorCode::NO_AVAILABLE_HANDLE;
+    auto remember_error = [&last_error](ErrorCode error) {
+        if (last_error == ErrorCode::NO_AVAILABLE_HANDLE &&
+            error != ErrorCode::NO_AVAILABLE_HANDLE) {
+            last_error = error;
+        }
+    };
 
     // Try preferred tier first
     if (preferred_tier.has_value()) {
@@ -328,9 +337,10 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
         if (it != tiers_.end()) {
             auto alloc_result = it->second->Allocate(size, out_loc->data);
             if (alloc_result) {
-                out_loc->tier = it->second.get();
-                return true;
+                out_loc->tier = it->second;
+                return {};
             }
+            remember_error(alloc_result.error());
         }
     }
 
@@ -344,11 +354,12 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
         auto& tier = it->second;
         auto alloc_result = tier->Allocate(size, out_loc->data);
         if (alloc_result) {
-            out_loc->tier = tier.get();
-            return true;
+            out_loc->tier = tier;
+            return {};
         }
+        remember_error(alloc_result.error());
     }
-    return false;
+    return tl::make_unexpected(last_error);
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
@@ -370,37 +381,41 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
         // Try allocation
         auto alloc_result = it->second->Allocate(size, loc.data);
         if (alloc_result) {
-            loc.tier = it->second.get();
+            loc.tier = it->second;
             return std::make_shared<AllocationEntry>(this, std::move(loc));
         }
 
         // Failed - try sync eviction if available
-        if (scheduler_) {
-            bool evicted = scheduler_->OnAllocationFailure(*preferred_tier);
+        if (scheduler_ &&
+            alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+            bool evicted =
+                scheduler_->OnAllocationFailure(*preferred_tier, size);
             if (evicted) {
                 // Retry after eviction
                 alloc_result = it->second->Allocate(size, loc.data);
                 if (alloc_result) {
                     LOG(INFO)
                         << "Strict allocation succeeded after sync eviction";
-                    loc.tier = it->second.get();
+                    loc.tier = it->second;
                     return std::make_shared<AllocationEntry>(this,
                                                              std::move(loc));
                 }
             }
         }
 
-        LOG(ERROR) << "Strict allocation failed on tier " << *preferred_tier;
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        LOG(ERROR) << "Strict allocation failed on tier " << *preferred_tier
+                   << ", error: " << alloc_result.error();
+        return tl::make_unexpected(alloc_result.error());
     }
 
     // Non-strict mode: try preferred tier + fallback (fast path)
-    if (AllocateInternalRaw(size, preferred_tier, &loc)) {
+    auto alloc_result = AllocateInternalRaw(size, preferred_tier, &loc);
+    if (alloc_result) {
         return std::make_shared<AllocationEntry>(this, std::move(loc));
     }
 
     // All tiers failed - try sync eviction if enabled
-    if (scheduler_) {
+    if (scheduler_ && alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
         // Determine which tier to evict from
         UUID evict_tier_id;
         if (preferred_tier.has_value()) {
@@ -416,18 +431,20 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
             evict_tier_id = sorted[0];
         }
 
-        bool evicted = scheduler_->OnAllocationFailure(evict_tier_id);
+        bool evicted = scheduler_->OnAllocationFailure(evict_tier_id, size);
         if (evicted) {
             // Retry allocation after eviction
-            if (AllocateInternalRaw(size, preferred_tier, &loc)) {
+            alloc_result = AllocateInternalRaw(size, preferred_tier, &loc);
+            if (alloc_result) {
                 LOG(INFO) << "Allocation succeeded after sync eviction";
                 return std::make_shared<AllocationEntry>(this, std::move(loc));
             }
         }
     }
 
-    LOG(ERROR) << "Failed to allocate " << size << " bytes";
-    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    LOG(ERROR) << "Failed to allocate " << size
+               << " bytes, error: " << alloc_result.error();
+    return tl::make_unexpected(alloc_result.error());
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
@@ -451,7 +468,7 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
 
 tl::expected<void, ErrorCode> TieredBackend::Commit(
     const std::string& key, AllocationHandle handle,
-    std::optional<uint64_t> expected_version) {
+    std::optional<uint64_t> expected_version, bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -504,6 +521,10 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
         return tl::make_unexpected(tier_commit_res.error());
     }
 
+    UUID current_tier_id = handle->loc.tier->GetTierId();
+    size_t handle_size =
+        handle->loc.data.buffer ? handle->loc.data.buffer->size() : 0;
+
     // Update Entry (Entry Write Lock)
     {
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
@@ -516,7 +537,6 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
         }
 
         // Insert or replace the handle for this tier
-        UUID current_tier_id = handle->loc.tier->GetTierId();
         bool found = false;
         for (auto& replica : entry->replicas) {
             if (replica.first == current_tier_id) {
@@ -538,8 +558,11 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
 
         // Increment Version on modification
         entry->version++;
+    }
 
-        if (scheduler_) {
+    if (scheduler_) {
+        scheduler_->OnCommit(key, current_tier_id, handle_size);
+        if (record_access) {
             scheduler_->OnAccess(key);
         }
     }
@@ -718,6 +741,9 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
         }
 
         if (found_tier) {
+            if (scheduler_) {
+                scheduler_->OnDelete(key, *tier_id);
+            }
             return tl::expected<void, ErrorCode>{};
         } else {
             LOG(ERROR) << "Tier not found: " << *tier_id;
@@ -762,14 +788,14 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
     // Ref count drops to 0 -> ~AllocationEntry() -> Free().
     // This happens concurrently without holding any locks.
     if (scheduler_) {
-        scheduler_->OnDelete(key);
+        scheduler_->OnDelete(key, std::nullopt);
     }
     return tl::expected<void, ErrorCode>{};
 }
 
 tl::expected<void, ErrorCode> TieredBackend::CopyData(
     const std::string& key, const DataSource& source, UUID dest_tier_id,
-    std::optional<uint64_t> expected_version) {
+    std::optional<uint64_t> expected_version, bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -794,7 +820,8 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
 
     // Commit (Add Replica)
     // Takes ownership of dest_handle into the map
-    auto commit_result = Commit(key, dest_handle.value(), expected_version);
+    auto commit_result =
+        Commit(key, dest_handle.value(), expected_version, record_access);
     if (!commit_result.has_value()) {
         // If CAS failed, we should probably warn specifically
         if (commit_result.error() != ErrorCode::CAS_FAILED) {
@@ -809,7 +836,8 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
 
 tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
                                                       UUID source_tier_id,
-                                                      UUID dest_tier_id) {
+                                                      UUID dest_tier_id,
+                                                      bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -841,7 +869,8 @@ tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
         }
     }
 
-    return CopyData(key, source_handle->loc.data, dest_tier_id, start_version);
+    return CopyData(key, source_handle->loc.data, dest_tier_id, start_version,
+                    record_access);
 }
 
 std::vector<TierView> TieredBackend::GetTierViews() const {

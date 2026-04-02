@@ -47,10 +47,13 @@ set(MOONCAKE_STORE_SOURCES
     tiered_cache/data_copier.cpp
     tiered_cache/tiered_backend.cpp
     data_manager.cpp
+    route_cache.cpp
     client_rpc_service.cpp
     peer_client.cpp
     tiered_cache/tiers/dram_tier.cpp
     tiered_cache/tiers/storage_tier.cpp
+    tiered_cache/scheduler/simple_policy.cpp
+    tiered_cache/scheduler/lru_policy.cpp
     tiered_cache/scheduler/client_scheduler.cpp
 )
 

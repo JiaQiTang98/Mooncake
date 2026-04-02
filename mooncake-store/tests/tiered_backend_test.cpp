@@ -6,6 +6,7 @@
 #include <cstdlib>
 
 #include "tiered_cache/tiered_backend.h"
+#include "utils/common.h"
 
 // Helper function to parse JSON string using thread-safe CharReaderBuilder
 static bool parseJsonString(const std::string& json_str, Json::Value& value,
@@ -139,7 +140,7 @@ TEST_F(TieredBackendTest, BasicDRAMTierInit) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_TRUE(result.has_value());
 
@@ -172,7 +173,7 @@ TEST_F(TieredBackendTest, DRAMTierWithNUMA) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_TRUE(result.has_value());
 
@@ -284,7 +285,7 @@ TEST_F(TieredBackendTest, MultipleDRAMTiers) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_TRUE(result.has_value());
 
@@ -306,7 +307,7 @@ TEST_F(TieredBackendTest, MissingTypeField) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_FALSE(result.has_value());
 }
@@ -325,7 +326,7 @@ TEST_F(TieredBackendTest, MissingCapacityField) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_FALSE(result.has_value());
 }
@@ -345,7 +346,7 @@ TEST_F(TieredBackendTest, InvalidCapacity) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_FALSE(result.has_value());
 }
@@ -365,7 +366,7 @@ TEST_F(TieredBackendTest, UnsupportedTierType) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_FALSE(result.has_value());
 }
@@ -385,7 +386,7 @@ TEST_F(TieredBackendTest, DefaultAllocatorType) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_TRUE(result.has_value());
 
@@ -409,7 +410,7 @@ TEST_F(TieredBackendTest, UnknownAllocatorType) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     // Should succeed and use default OFFSET allocator
     EXPECT_TRUE(result.has_value());
@@ -440,8 +441,7 @@ TEST_F(TieredBackendTest, AllocateBasic) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Allocate space
     auto result = backend.Allocate(SMALL_DATA_SIZE);
@@ -473,8 +473,7 @@ TEST_F(TieredBackendTest, AllocateInsufficientSpace) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Try to allocate more than capacity
     auto result = backend.Allocate(LARGE_DATA_SIZE);
@@ -505,8 +504,7 @@ TEST_F(TieredBackendTest, AllocateOnSpecifiedTier) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Get low priority tier ID
     auto low_priority_tier_id = GetTierIdByPriority(backend, 50);
@@ -537,8 +535,7 @@ TEST_F(TieredBackendTest, AllocateAutoRelease) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     auto tier_views = backend.GetTierViews();
     ASSERT_EQ(tier_views.size(), 1);
@@ -582,8 +579,7 @@ TEST_F(TieredBackendTest, WriteBasic) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Allocate space
     auto alloc_result = backend.Allocate(SMALL_DATA_SIZE);
@@ -618,8 +614,7 @@ TEST_F(TieredBackendTest, WriteInvalidHandle) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Create invalid (null) handle
     AllocationHandle invalid_handle;
@@ -658,8 +653,7 @@ TEST_F(TieredBackendTest, CommitBasic) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Allocate and write
     auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
@@ -694,8 +688,7 @@ TEST_F(TieredBackendTest, CommitReplace) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // First commit
     auto test_buffer1 = CreateTestBuffer(SMALL_DATA_SIZE);
@@ -737,8 +730,7 @@ TEST_F(TieredBackendTest, CommitInvalidHandle) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Create invalid handle
     AllocationHandle invalid_handle;
@@ -770,8 +762,7 @@ TEST_F(TieredBackendTest, GetBasic) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Allocate, write and commit
     auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
@@ -805,8 +796,7 @@ TEST_F(TieredBackendTest, GetNonExistentKey) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Try to get non-existent key
     auto get_result = backend.Get("non_existent_key");
@@ -837,8 +827,7 @@ TEST_F(TieredBackendTest, GetFromSpecifiedTier) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     auto high_tier_id = GetTierIdByPriority(backend, 100);
     auto low_tier_id = GetTierIdByPriority(backend, 50);
@@ -887,8 +876,7 @@ TEST_F(TieredBackendTest, GetHighestPriority) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     auto high_tier_id = GetTierIdByPriority(backend, 100);
     auto low_tier_id = GetTierIdByPriority(backend, 50);
@@ -937,8 +925,7 @@ TEST_F(TieredBackendTest, GetTierNotFound) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     auto high_tier_id = GetTierIdByPriority(backend, 100);
     auto low_tier_id = GetTierIdByPriority(backend, 50);
@@ -984,8 +971,7 @@ TEST_F(TieredBackendTest, DeleteSingleReplica) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     auto high_tier_id = GetTierIdByPriority(backend, 100);
     auto low_tier_id = GetTierIdByPriority(backend, 50);
@@ -1041,8 +1027,7 @@ TEST_F(TieredBackendTest, DeleteAllReplicas) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     auto high_tier_id = GetTierIdByPriority(backend, 100);
     auto low_tier_id = GetTierIdByPriority(backend, 50);
@@ -1088,8 +1073,7 @@ TEST_F(TieredBackendTest, DeleteNonExistentKey) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Try to delete non-existent key
     auto delete_result = backend.Delete("non_existent_key");
@@ -1118,8 +1102,7 @@ TEST_F(TieredBackendTest, CompleteDataLifecycle) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     const std::string key = "lifecycle_key";
 
@@ -1179,8 +1162,7 @@ TEST_F(TieredBackendTest, MultiTierDataManagement) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     auto high_tier_id = GetTierIdByPriority(backend, 100);
     auto low_tier_id = GetTierIdByPriority(backend, 50);
@@ -1240,8 +1222,7 @@ TEST_F(TieredBackendTest, ConcurrentAllocations) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     const int num_allocations = 10;
     std::vector<AllocationHandle> handles;
@@ -1298,8 +1279,7 @@ TEST_F(TieredBackendTest, MultiTierInteraction) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     auto tier_views = backend.GetTierViews();
     ASSERT_EQ(tier_views.size(), 2);
@@ -1407,8 +1387,7 @@ TEST_F(TieredBackendTest, StoragePrefetch) {
     std::filesystem::create_directories(
         "/tmp/mooncake_test_prefetch/file_per_key_dir");
 
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     auto tiers = backend.GetTierViews();
     ASSERT_EQ(tiers.size(), 2);

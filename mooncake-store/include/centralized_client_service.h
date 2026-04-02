@@ -59,6 +59,11 @@ class CentralizedClientService
     BatchQuery(const std::vector<std::string>& object_keys,
                const ReadRouteConfig& config = {}) override;
 
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
+        const std::vector<std::string>& keys) override;
+
     DeploymentMode deployment_mode() const override {
         return DeploymentMode::CENTRALIZATION;
     }
@@ -67,22 +72,27 @@ class CentralizedClientService
         const std::vector<std::string>& object_keys, const UUID& client_id,
         const std::string& segment_name);
 
-    tl::expected<void, ErrorCode> Get(const std::string& object_key,
-                                      const QueryResult& query_result,
-                                      std::vector<Slice>& slices) override;
+    tl::expected<int64_t, ErrorCode> Get(
+        const std::string& key, const std::vector<void*>& buffers,
+        const std::vector<size_t>& sizes,
+        const ReadRouteConfig& config = {}) override;
 
-    tl::expected<void, ErrorCode> Get(const std::string& object_key,
-                                      std::vector<Slice>& slices);
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<void*>>& all_buffers,
+        const std::vector<std::vector<size_t>>& all_sizes,
+        const ReadRouteConfig& config = {},
+        bool aggregate_same_segment_task = false) override;
 
-    std::vector<tl::expected<void, ErrorCode>> BatchGet(
-        const std::vector<std::string>& object_keys,
-        const std::vector<std::unique_ptr<QueryResult>>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false) override;
+    tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
+        const std::string& key,
+        std::shared_ptr<ClientBufferAllocator> allocator,
+        const ReadRouteConfig& config = {}) override;
 
-    std::vector<tl::expected<void, ErrorCode>> BatchGet(
-        const std::vector<std::string>& object_keys,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
+    std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
+    BatchGet(const std::vector<std::string>& keys,
+             std::shared_ptr<ClientBufferAllocator> allocator,
+             const ReadRouteConfig& config = {}) override;
 
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
                                       std::vector<Slice>& slices,
@@ -121,7 +131,7 @@ class CentralizedClientService
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
-    tl::expected<void, ErrorCode> RegisterClient() override;
+    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient() override;
 
    protected:
     HeartbeatRequest build_heartbeat_request() override;
@@ -135,6 +145,16 @@ class CentralizedClientService
         const std::vector<std::string>& object_keys,
         const std::vector<std::unique_ptr<QueryResult>>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
+
+    tl::expected<void, ErrorCode> InnerGet(const std::string& object_key,
+                                           const QueryResult& query_result,
+                                           std::vector<Slice>& slices);
+
+    std::vector<tl::expected<void, ErrorCode>> InnerBatchGet(
+        const std::vector<std::string>& object_keys,
+        const std::vector<std::unique_ptr<QueryResult>>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        bool prefer_same_node = false);
 
     std::vector<PutOperation> CreatePutOperations(
         const std::vector<ObjectKey>& keys,

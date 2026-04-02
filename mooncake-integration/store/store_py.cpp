@@ -383,6 +383,9 @@ class MooncakeStorePyWrapper {
         {
             py::gil_scoped_release release_gil;
             total_length = store_->get_into(key, buffer, size, config);
+            if (total_length <= 0) {
+                return pybind11::none();
+            }
         }
 
         return buffer_to_tensor(NULL, buffer, total_length);
@@ -440,8 +443,13 @@ class MooncakeStorePyWrapper {
 
         py::list results_list;
         for (size_t i = 0; i < total_lengths.size(); i++) {
-            const auto& buffer = buffers[i];
             const auto total_length = total_lengths[i];
+            if (total_length <= 0) {
+                // failed to read this key, return the error code
+                results_list.append(total_length);
+                continue;
+            }
+            const auto& buffer = buffers[i];
             results_list.append(buffer_to_tensor(
                 NULL, static_cast<char*>(buffer), total_length));
         }
@@ -1503,7 +1511,7 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::string>& keys,
                const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs,
                const std::vector<std::vector<size_t>>& all_sizes,
-               bool prefer_alloc_in_same_node = false,
+               bool aggregate_same_segment_task = false,
                const std::optional<ReadRouteConfig>& config_opt =
                    std::nullopt) {
                 ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
@@ -1516,10 +1524,10 @@ PYBIND11_MODULE(store, m) {
                 }
                 return self.store_->batch_get_into_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
-                    prefer_alloc_in_same_node, config);
+                    aggregate_same_segment_task, config);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
-            py::arg("prefer_alloc_in_same_node") = false,
+            py::arg("aggregate_same_segment_task") = false,
             py::arg("config") = py::none(),
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "

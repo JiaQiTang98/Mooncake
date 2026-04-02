@@ -25,7 +25,7 @@ class ClientScheduler;  // Forward declaration
  * storage.
  */
 struct TieredLocation {
-    CacheTier* tier;
+    std::shared_ptr<CacheTier> tier;
     struct DataSource data;
 };
 
@@ -56,7 +56,7 @@ enum REMOVE_CALLBACK_TYPE { DELETE = 0, DELETE_ALL = 1 };
  * @brief The internal state of an allocation.
  * acts as the "Control Block" for the resource.
  * When the last shared_ptr pointing to this entry dies, the destructor
- * triggers the physical release of the resource via the Backend.
+ * releases the resource through the owning tier.
  */
 struct AllocationEntry {
     TieredBackend* backend;
@@ -164,7 +164,8 @@ class TieredBackend {
      */
     tl::expected<void, ErrorCode> Commit(
         const std::string& key, AllocationHandle handle,
-        std::optional<uint64_t> expected_version = std::nullopt);
+        std::optional<uint64_t> expected_version = std::nullopt,
+        bool record_access = true);
 
     /**
      * @brief Checks if a key exists in the backend.
@@ -198,11 +199,13 @@ class TieredBackend {
 
     tl::expected<void, ErrorCode> CopyData(
         const std::string& key, const DataSource& source, UUID dest_tier_id,
-        std::optional<uint64_t> expected_version = std::nullopt);
+        std::optional<uint64_t> expected_version = std::nullopt,
+        bool record_access = true);
 
     tl::expected<void, ErrorCode> Transfer(const std::string& key,
                                            UUID source_tier_id,
-                                           UUID dest_tier_id);
+                                           UUID dest_tier_id,
+                                           bool record_access = true);
 
     // --- Introspection & Internal ---
 
@@ -239,12 +242,13 @@ class TieredBackend {
     std::vector<UUID> GetSortedTiers() const;
 
     // Low-level allocation logic
-    bool AllocateInternalRaw(size_t size, std::optional<UUID> preferred_tier,
-                             TieredLocation* out_loc);
+    tl::expected<void, ErrorCode> AllocateInternalRaw(
+        size_t size, std::optional<UUID> preferred_tier,
+        TieredLocation* out_loc);
 
    private:
     // Map from tier ID to the actual CacheTier instance.
-    std::unordered_map<UUID, std::unique_ptr<CacheTier>> tiers_;
+    std::unordered_map<UUID, std::shared_ptr<CacheTier>> tiers_;
 
     // Map from tier ID to static config info
     std::unordered_map<UUID, TierInfo> tier_info_;
