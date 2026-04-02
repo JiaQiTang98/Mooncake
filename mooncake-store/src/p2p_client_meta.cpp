@@ -54,6 +54,11 @@ size_t P2PClientMeta::GetAvailableCapacity() const {
     return client_capacity_ - client_usage_;
 }
 
+auto P2PClientMeta::QuerySegmentGroupId(const UUID& segment_id) const
+    -> tl::expected<std::string, ErrorCode> {
+    return segment_manager_->QuerySegmentGroupId(segment_id);
+}
+
 auto P2PClientMeta::CollectWriteRouteCandidates(
     const WriteRouteRequest& req, std::vector<WriteCandidate>& candidates)
     -> tl::expected<bool, ErrorCode> {
@@ -113,6 +118,7 @@ auto P2PClientMeta::CollectWriteRouteCandidates(
         candidate.replica.ip_address = ip_address_;
         candidate.replica.rpc_port = rpc_port_;
         candidate.replica.object_size = req.size;
+        candidate.replica.segment_group_id = p2p_extra.group_id;
 
         candidates.push_back(std::move(candidate));
         if (req.config.early_return &&

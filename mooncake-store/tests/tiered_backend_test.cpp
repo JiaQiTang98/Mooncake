@@ -43,9 +43,19 @@ class TieredBackendTest : public ::testing::Test {
 
     void TearDown() override {
         // Cleanup storage directories created by tests
+        unsetenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR");
+        unsetenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
         std::filesystem::remove_all("/tmp/mooncake_test_storage");
         std::filesystem::remove_all("/tmp/mooncake_test_bucket");
         std::filesystem::remove_all("/tmp/mooncake_test_multitier");
+    }
+
+    void ConfigureFilePerKeyStorage(const std::string& path) {
+        setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+               "file_per_key_storage_backend", 1);
+        setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", path.c_str(), 1);
+        std::filesystem::remove_all(path);
+        std::filesystem::create_directories(path);
     }
 
     // Helper: Create test buffer with specified size
@@ -168,6 +178,88 @@ TEST_F(TieredBackendTest, DRAMTierWithNUMA) {
 
     auto tier_views = backend.GetTierViews();
     EXPECT_EQ(tier_views.size(), 1);
+}
+
+// Scenario purpose:
+// Verify backward-compatible default: when segment_group is not configured,
+// every tier is assigned to the same default group ("default").
+TEST_F(TieredBackendTest, UnconfiguredTiersUseDefaultSegmentGroup) {
+    ConfigureFilePerKeyStorage("/tmp/mooncake_test_storage/default_group");
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 536870912,
+                "priority": 100,
+                "allocator_type": "OFFSET"
+            },
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 10
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    ASSERT_TRUE(result.has_value());
+
+    auto tier_views = backend.GetTierViews();
+    ASSERT_EQ(tier_views.size(), 2);
+    for (const auto& view : tier_views) {
+        EXPECT_EQ(view.group_id, "default");
+    }
+}
+
+// Scenario purpose:
+// Verify mixed configuration works: configured tiers keep explicit group_id,
+// while unconfigured tiers fall back to "default" in the same client config.
+TEST_F(TieredBackendTest, MixedConfiguredAndDefaultSegmentGroups) {
+    ConfigureFilePerKeyStorage("/tmp/mooncake_test_storage/mixed_group");
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 536870912,
+                "priority": 100,
+                "allocator_type": "OFFSET",
+                "segment_group": "hot"
+            },
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 10
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    ASSERT_TRUE(result.has_value());
+
+    auto tier_views = backend.GetTierViews();
+    ASSERT_EQ(tier_views.size(), 2);
+
+    bool found_hot = false;
+    bool found_default = false;
+    for (const auto& view : tier_views) {
+        if (view.priority == 100) {
+            EXPECT_EQ(view.group_id, "hot");
+            found_hot = true;
+        } else if (view.priority == 10) {
+            EXPECT_EQ(view.group_id, "default");
+            found_default = true;
+        }
+    }
+    EXPECT_TRUE(found_hot);
+    EXPECT_TRUE(found_default);
 }
 
 // Test multiple DRAM tiers

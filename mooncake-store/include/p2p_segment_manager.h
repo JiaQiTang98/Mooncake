@@ -5,10 +5,21 @@
 #include "types.h"
 
 namespace mooncake {
+struct P2PSegmentGroup {
+    std::string group_id;
+    std::vector<UUID> ordered_segments;
+};
+
 class P2PSegmentManager : public SegmentManager {
    public:
     auto QuerySegments(const std::string& segment)
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode> override;
+
+    auto QuerySegmentGroupId(const UUID& segment_id) const
+        -> tl::expected<std::string, ErrorCode>;
+
+    auto QuerySegmentGroup(const std::string& group_id) const
+        -> tl::expected<P2PSegmentGroup, ErrorCode>;
 
     using OnSegmentAddedCallback = std::function<void(const Segment& segment)>;
     using OnSegmentRemovedCallback =
@@ -47,6 +58,10 @@ class P2PSegmentManager : public SegmentManager {
    private:
     OnSegmentAddedCallback on_segment_added_;
     OnSegmentRemovedCallback on_segment_removed_;
+    std::unordered_map<UUID, std::string, boost::hash<UUID>>
+        segment_to_group_ GUARDED_BY(segment_mutex_);
+    std::unordered_map<std::string, P2PSegmentGroup> groups_
+        GUARDED_BY(segment_mutex_);
 };
 
 }  // namespace mooncake

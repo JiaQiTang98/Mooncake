@@ -30,12 +30,14 @@ class ClientRpcService {
     /**
      * @brief Read remote data: Client A requests Client B to read data and
      * transfer to A
-     * @param request RemoteReadRequest containing key and destination buffers
+     * @param request RemoteReadRequest containing key, destination buffers,
+     * and optional target_tier_id/target_segment_group_id
      * @return ErrorCode indicating success or failure
      *
      * Flow:
-     * 1. DataManager.ReadRemoteData(key, dest_buffers)
-     * 2. TieredBackend.Get(key) → handle
+     * 1. DataManager.ReadRemoteData(key, dest_buffers, target_tier_id,
+     *    target_segment_group_id)
+     * 2. TieredBackend.Get(...) → handle
      * 3. TransferEngine.submitTransfer(WRITE) to transfer data from B to A
      */
     tl::expected<void, ErrorCode> ReadRemoteData(

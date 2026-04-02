@@ -29,12 +29,14 @@ class P2PMasterServiceTest : public ::testing::Test {
     Segment MakeP2PSegment(std::string name = "p2p_segment",
                            size_t size = kDefaultSegmentSize,
                            std::vector<std::string> tags = {}, int priority = 0,
-                           MemoryType memory_type = MemoryType::DRAM) {
+                           MemoryType memory_type = MemoryType::DRAM,
+                           std::string group_id = "default") {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = std::move(name);
         segment.size = size;
         segment.extra = P2PSegmentExtraData{
+            .group_id = std::move(group_id),
             .priority = priority,
             .tags = std::move(tags),
             .memory_type = memory_type,
@@ -98,6 +100,34 @@ TEST_F(P2PMasterServiceTest, RegisterClientBasic) {
     EXPECT_TRUE(seg_res.has_value());
 }
 
+TEST_F(P2PMasterServiceTest, RegisterClientPreservesSegmentGroup) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {"gpu"}, 5,
+                              MemoryType::DRAM, "hot");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    auto segment_res = service->GetClientManager().QuerySegment(client_id, seg.id);
+    ASSERT_TRUE(segment_res.has_value());
+    ASSERT_TRUE(segment_res.value()->IsP2PSegment());
+    EXPECT_EQ(segment_res.value()->GetP2PExtra().group_id, "hot");
+}
+
+TEST_F(P2PMasterServiceTest, MountSegmentPreservesDefaultGroup) {
+    auto service = CreateService();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {}, "127.0.0.1", 50051);
+
+    auto seg = MakeP2PSegment("seg1");
+    auto mount_res = service->MountSegment(seg, client_id);
+    ASSERT_TRUE(mount_res.has_value());
+
+    auto segment_res = service->GetClientManager().QuerySegment(client_id, seg.id);
+    ASSERT_TRUE(segment_res.has_value());
+    ASSERT_TRUE(segment_res.value()->IsP2PSegment());
+    EXPECT_EQ(segment_res.value()->GetP2PExtra().group_id, "default");
+}
+
 TEST_F(P2PMasterServiceTest, RegisterClientDuplicate) {
     auto service = CreateService();
     auto seg = MakeP2PSegment();
@@ -136,6 +166,8 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteBasic) {
     EXPECT_EQ(1, res.value().candidates.size());
     EXPECT_EQ(client_id, res.value().candidates[0].replica.client_id);
     EXPECT_EQ(seg.id, res.value().candidates[0].replica.segment_id);
+    ASSERT_TRUE(res.value().candidates[0].replica.segment_group_id.has_value());
+    EXPECT_EQ("default", *res.value().candidates[0].replica.segment_group_id);
 }
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteNoCapacity) {
@@ -202,6 +234,27 @@ TEST_F(P2PMasterServiceTest, GetWriteRoutePriorityFilter) {
     ASSERT_TRUE(res.has_value());
     EXPECT_EQ(1, res.value().candidates.size());
     EXPECT_EQ(client2, res.value().candidates[0].replica.client_id);
+}
+
+TEST_F(P2PMasterServiceTest, GetWriteRouteCarriesConfiguredGroupId) {
+    auto service = CreateService();
+    auto seg_hot =
+        MakeP2PSegment("seg_hot", kDefaultSegmentSize, {}, 10,
+                       MemoryType::DRAM, "hot");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg_hot}, "10.0.0.1", 50051);
+
+    WriteRouteRequest req;
+    req.key = "test_key_group";
+    req.client_id = generate_uuid();
+    req.size = 1024;
+    req.config.max_candidates = 1;
+
+    auto res = service->GetWriteRoute(req);
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1, res.value().candidates.size());
+    ASSERT_TRUE(res.value().candidates[0].replica.segment_group_id.has_value());
+    EXPECT_EQ("hot", *res.value().candidates[0].replica.segment_group_id);
 }
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteAllowLocal) {
@@ -278,7 +331,94 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteMultipleSegments) {
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(3, res.value().candidates.size());
+    EXPECT_EQ(2, res.value().candidates.size());
+}
+
+// Scenario purpose:
+// Verify write-route collapses multiple physical segments in the same
+// (client_id, group_id) into one logical candidate and keeps the higher
+// priority segment as route target.
+TEST_F(P2PMasterServiceTest, GetWriteRouteReturnsSingleCandidatePerGroup) {
+    auto service = CreateService();
+    auto seg_low = MakeP2PSegment("seg_low", kDefaultSegmentSize, {}, 5,
+                                  MemoryType::DRAM, "hot");
+    auto seg_high = MakeP2PSegment("seg_high", kDefaultSegmentSize, {}, 10,
+                                   MemoryType::DRAM, "hot");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg_low, seg_high}, "127.0.0.1",
+                      50051);
+
+    WriteRouteRequest req;
+    req.key = "test_key";
+    req.client_id = generate_uuid();
+    req.size = 1024;
+    req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+
+    auto res = service->GetWriteRoute(req);
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1, res.value().candidates.size());
+    EXPECT_EQ(client_id, res.value().candidates[0].replica.client_id);
+    EXPECT_EQ(seg_high.id, res.value().candidates[0].replica.segment_id);
+}
+
+// Scenario purpose:
+// Verify intra-group candidate selection tie-breaks by available capacity
+// when segment priorities are equal.
+TEST_F(P2PMasterServiceTest, GetWriteRouteUsesAvailableCapacityAsTieBreaker) {
+    auto service = CreateService();
+    auto seg_small = MakeP2PSegment("seg_small", 1024 * 1024, {}, 10,
+                                    MemoryType::DRAM, "hot");
+    auto seg_large = MakeP2PSegment("seg_large", 2 * 1024 * 1024, {}, 10,
+                                    MemoryType::DRAM, "hot");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg_small, seg_large},
+                      "127.0.0.1", 50051);
+
+    WriteRouteRequest req;
+    req.key = "test_key";
+    req.client_id = generate_uuid();
+    req.size = 1024;
+    req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+
+    auto res = service->GetWriteRoute(req);
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1, res.value().candidates.size());
+    EXPECT_EQ(seg_large.id, res.value().candidates[0].replica.segment_id);
+}
+
+// Scenario purpose:
+// Verify group-level max replica constraint:
+// 1) key already occupies one logical replica group;
+// 2) routing should be restricted to that existing group only;
+// 3) selected segment should still be the best one inside that group.
+TEST_F(P2PMasterServiceTest,
+       GetWriteRouteRespectsGroupLimitAndReturnsPreferredSegment) {
+    auto service = CreateService(/* max_replicas_per_key= */ 1);
+    auto seg_low = MakeP2PSegment("seg_low", kDefaultSegmentSize, {}, 5,
+                                  MemoryType::DRAM, "hot");
+    auto seg_high = MakeP2PSegment("seg_high", kDefaultSegmentSize, {}, 10,
+                                   MemoryType::DRAM, "hot");
+    auto seg_other = MakeP2PSegment("seg_other", kDefaultSegmentSize, {}, 20,
+                                    MemoryType::DRAM, "cold");
+    auto client_hot = generate_uuid();
+    auto client_cold = generate_uuid();
+    RegisterP2PClient(*service, client_hot, {seg_low, seg_high}, "10.0.0.1",
+                      50051);
+    RegisterP2PClient(*service, client_cold, {seg_other}, "10.0.0.2", 50052);
+
+    AddReplicaHelper(*service, "key1", 1024, client_hot, seg_low.id);
+
+    WriteRouteRequest req;
+    req.key = "key1";
+    req.client_id = generate_uuid();
+    req.size = 1024;
+    req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+
+    auto res = service->GetWriteRoute(req);
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1, res.value().candidates.size());
+    EXPECT_EQ(client_hot, res.value().candidates[0].replica.client_id);
+    EXPECT_EQ(seg_high.id, res.value().candidates[0].replica.segment_id);
 }
 
 // ============================================================
@@ -309,6 +449,29 @@ TEST_F(P2PMasterServiceTest, AddReplicaBasic) {
     EXPECT_TRUE(desc.is_p2p_proxy_replica());
     EXPECT_EQ(client_id, desc.get_p2p_proxy_descriptor().client_id);
     EXPECT_EQ(seg.id, desc.get_p2p_proxy_descriptor().segment_id);
+}
+
+TEST_F(P2PMasterServiceTest, AddReplicaRejectsMismatchedSegmentGroup) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {}, 1,
+                              MemoryType::DRAM, "hot");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    AddReplicaRequest req;
+    req.key = "key1";
+    req.size = 1024;
+    req.replica.client_id = client_id;
+    req.replica.segment_id = seg.id;
+    req.replica.segment_group_id = "cold";
+
+    auto res = service->AddReplica(req);
+    EXPECT_FALSE(res.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, res.error());
+
+    auto get_res = service->GetReplicaList(req.key);
+    EXPECT_FALSE(get_res.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_res.error());
 }
 
 TEST_F(P2PMasterServiceTest, AddReplicaDuplicate) {
@@ -355,6 +518,37 @@ TEST_F(P2PMasterServiceTest, AddReplicaMaxLimit) {
     req.size = 1024;
     req.replica.client_id = client3;
     req.replica.segment_id = seg3.id;
+    auto res = service->AddReplica(req);
+    EXPECT_FALSE(res.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_NUM_EXCEEDED, res.error());
+}
+
+// Scenario purpose:
+// Verify max_replicas_per_key counts logical groups instead of physical
+// segments. Multiple segments in the same group should not consume extra
+// logical replica quota.
+TEST_F(P2PMasterServiceTest, AddReplicaMaxLimitCountsGroups) {
+    auto service = CreateService(/* max_replicas_per_key= */ 1);
+    auto seg_hot_a = MakeP2PSegment("seg_hot_a", kDefaultSegmentSize, {}, 5,
+                                    MemoryType::DRAM, "hot");
+    auto seg_hot_b = MakeP2PSegment("seg_hot_b", kDefaultSegmentSize, {}, 10,
+                                    MemoryType::DRAM, "hot");
+    auto seg_cold = MakeP2PSegment("seg_cold", kDefaultSegmentSize, {}, 20,
+                                   MemoryType::DRAM, "cold");
+    auto client_hot = generate_uuid();
+    auto client_cold = generate_uuid();
+    RegisterP2PClient(*service, client_hot, {seg_hot_a, seg_hot_b}, "10.0.0.1",
+                      50051);
+    RegisterP2PClient(*service, client_cold, {seg_cold}, "10.0.0.2", 50052);
+
+    AddReplicaHelper(*service, "key1", 1024, client_hot, seg_hot_a.id);
+    AddReplicaHelper(*service, "key1", 1024, client_hot, seg_hot_b.id);
+
+    AddReplicaRequest req;
+    req.key = "key1";
+    req.size = 1024;
+    req.replica.client_id = client_cold;
+    req.replica.segment_id = seg_cold.id;
     auto res = service->AddReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NUM_EXCEEDED, res.error());
@@ -460,6 +654,46 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaNotFound) {
     EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, res.error());
 }
 
+// Scenario purpose:
+// Verify deleting one physical segment inside a group does not delete the
+// logical replica as long as other segments in the same group still host data.
+TEST_F(P2PMasterServiceTest, RemoveReplicaWithinGroupKeepsLogicalReplica) {
+    auto service = CreateService();
+    auto seg_low = MakeP2PSegment("seg_low", kDefaultSegmentSize, {}, 5,
+                                  MemoryType::DRAM, "hot");
+    auto seg_high = MakeP2PSegment("seg_high", kDefaultSegmentSize, {}, 10,
+                                   MemoryType::DRAM, "hot");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg_low, seg_high}, "127.0.0.1",
+                      50051);
+
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg_low.id);
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg_high.id);
+
+    auto before_remove = service->GetReplicaList("key1");
+    ASSERT_TRUE(before_remove.has_value());
+    ASSERT_EQ(1, before_remove.value().replicas.size());
+    EXPECT_EQ(seg_high.id,
+              before_remove.value().replicas[0]
+                  .get_p2p_proxy_descriptor()
+                  .segment_id);
+
+    RemoveReplicaRequest req;
+    req.key = "key1";
+    req.client_id = client_id;
+    req.segment_id = seg_high.id;
+    auto res = service->RemoveReplica(req);
+    ASSERT_TRUE(res.has_value());
+
+    auto after_remove = service->GetReplicaList("key1");
+    ASSERT_TRUE(after_remove.has_value());
+    ASSERT_EQ(1, after_remove.value().replicas.size());
+    EXPECT_EQ(seg_low.id,
+              after_remove.value().replicas[0]
+                  .get_p2p_proxy_descriptor()
+                  .segment_id);
+}
+
 TEST_F(P2PMasterServiceTest, RemoveReplicaObjectNotFound) {
     auto service = CreateService();
 
@@ -487,6 +721,28 @@ TEST_F(P2PMasterServiceTest, GetReplicaListBasic) {
     auto res = service->GetReplicaList("key1");
     ASSERT_TRUE(res.has_value());
     EXPECT_EQ(1, res.value().replicas.size());
+}
+
+// Scenario purpose:
+// Verify read route returns one logical replica per group (group-collapsed),
+// and chooses the highest-priority resident segment within that group.
+TEST_F(P2PMasterServiceTest, GetReplicaListCollapsesSameGroupReplicas) {
+    auto service = CreateService();
+    auto seg_low = MakeP2PSegment("seg_low", kDefaultSegmentSize, {"fast"}, 5,
+                                  MemoryType::DRAM, "hot");
+    auto seg_high = MakeP2PSegment("seg_high", kDefaultSegmentSize, {"fast"},
+                                   10, MemoryType::DRAM, "hot");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg_low, seg_high}, "127.0.0.1",
+                      50051);
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg_low.id);
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg_high.id);
+
+    auto res = service->GetReplicaList("key1");
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1, res.value().replicas.size());
+    EXPECT_EQ(seg_high.id,
+              res.value().replicas[0].get_p2p_proxy_descriptor().segment_id);
 }
 
 TEST_F(P2PMasterServiceTest, GetReplicaListNotFound) {
@@ -631,11 +887,51 @@ TEST_F(P2PMasterServiceTest, MountUnmountSegment) {
     ASSERT_TRUE(unmount_res2.has_value());
 }
 
+// Scenario purpose:
+// Verify segment unmount updates group residency incrementally:
+// 1) unmounting one segment in a group should keep logical replica alive if
+//    another segment in that group remains;
+// 2) unmounting the last resident segment should remove the object route.
+TEST_F(P2PMasterServiceTest, UnmountSegmentWithinGroupKeepsLogicalReplica) {
+    auto service = CreateService();
+    auto seg_low = MakeP2PSegment("seg_low", kDefaultSegmentSize, {}, 5,
+                                  MemoryType::DRAM, "hot");
+    auto seg_high = MakeP2PSegment("seg_high", kDefaultSegmentSize, {}, 10,
+                                   MemoryType::DRAM, "hot");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg_low, seg_high}, "127.0.0.1",
+                      50051);
+
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg_low.id);
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg_high.id);
+
+    auto unmount_high = service->UnmountSegment(seg_high.id, client_id);
+    ASSERT_TRUE(unmount_high.has_value());
+
+    auto after_first_unmount = service->GetReplicaList("key1");
+    ASSERT_TRUE(after_first_unmount.has_value());
+    ASSERT_EQ(1, after_first_unmount.value().replicas.size());
+    EXPECT_EQ(seg_low.id,
+              after_first_unmount.value().replicas[0]
+                  .get_p2p_proxy_descriptor()
+                  .segment_id);
+
+    auto unmount_low = service->UnmountSegment(seg_low.id, client_id);
+    ASSERT_TRUE(unmount_low.has_value());
+
+    auto after_second_unmount = service->GetReplicaList("key1");
+    EXPECT_FALSE(after_second_unmount.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, after_second_unmount.error());
+}
+
 // ============================================================
 // Integration: Write Route → Add → Read → Remove cycle
 // ============================================================
 
 TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
+    // Scenario purpose:
+    // End-to-end sanity for the main metadata lifecycle path in P2P mode:
+    // route selection -> add replica -> read route -> remove replica.
     auto service = CreateService();
     auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {"gpu"}, 5,
                               MemoryType::DRAM);

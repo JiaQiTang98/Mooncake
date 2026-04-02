@@ -55,6 +55,10 @@ Replica::Descriptor Replica::get_descriptor() const {
             LOG(ERROR) << "Trying to get invalid p2p replica descriptor";
         } else {
             proxy_desc.segment_id = proxy_data.segment->id;
+            if (proxy_data.segment->IsP2PSegment()) {
+                proxy_desc.segment_group_id =
+                    proxy_data.segment->GetP2PExtra().group_id;
+            }
         }
         proxy_desc.object_size = proxy_data.object_size;
         desc.descriptor_variant = std::move(proxy_desc);
@@ -83,6 +87,9 @@ std::ostream& operator<<(std::ostream& os, const Replica::Descriptor& desc) {
             } else if constexpr (std::is_same_v<T, P2PProxyDescriptor>) {
                 os << "type: P2P_PROXY, client: " << d.client_id
                    << ", segment: " << d.segment_id
+                   << ", group: "
+                   << (d.segment_group_id.has_value() ? d.segment_group_id.value()
+                                                      : "N/A")
                    << ", endpoint: " << d.ip_address << ":" << d.rpc_port
                    << ", size: " << d.object_size;
             }

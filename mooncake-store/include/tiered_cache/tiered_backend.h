@@ -40,6 +40,7 @@ struct TierView {
     size_t capacity;
     size_t usage;
     size_t free_space;
+    std::string group_id;
     int priority;
     std::vector<std::string> tags;
 };
@@ -213,11 +214,13 @@ class TieredBackend {
    private:
     tl::expected<void, ErrorCode> MountSegment(
         UUID id, size_t capacity, int priority,
-        const std::vector<std::string>& tags, MemoryType memory_type);
+        const std::vector<std::string>& tags, MemoryType memory_type,
+        const std::string& group_id);
 
     struct TierInfo {
         int priority;
         std::vector<std::string> tags;
+        std::string group_id;
     };
 
     /**

@@ -225,7 +225,8 @@ class P2PClientService final : public ClientService {
      * @brief Put data to local TieredBackend via DataManager.
      */
     tl::expected<void, ErrorCode> PutLocal(const std::string& key,
-                                           std::vector<Slice>& slices);
+                                           std::vector<Slice>& slices,
+                                           std::optional<UUID> tier_id);
 
     /**
      * @brief Put data to a remote node via Master's write route.
@@ -239,7 +240,10 @@ class P2PClientService final : public ClientService {
      * @brief Get data from local TieredBackend via DataManager.
      */
     tl::expected<void, ErrorCode> GetLocal(const std::string& key,
-                                           std::vector<Slice>& slices);
+                                           std::vector<Slice>& slices,
+                                           std::optional<UUID> tier_id,
+                                           std::optional<std::string>
+                                               segment_group_id = std::nullopt);
 
     /**
      * @brief Get data from a remote node via Master's read route.

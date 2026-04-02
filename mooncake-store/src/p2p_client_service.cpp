@@ -210,6 +210,15 @@ tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
     req.replica.segment_id = tier_id;
     req.replica.rpc_port = client_rpc_port_;
     req.replica.ip_address = local_ip_;
+    if (data_manager_.has_value()) {
+        auto tier_views = data_manager_->GetTierViews();
+        auto tier_it =
+            std::find_if(tier_views.begin(), tier_views.end(),
+                         [&](const TierView& view) { return view.id == tier_id; });
+        if (tier_it != tier_views.end()) {
+            req.replica.segment_group_id = tier_it->group_id;
+        }
+    }
     auto result = master_client_.AddReplica(req);
     if (!result) {
         LOG(ERROR) << "Failed to add replica for key: " << key
@@ -316,6 +325,7 @@ std::vector<Segment> P2PClientService::CollectTierSegments() const {
         seg.id = view.id;
         seg.size = view.capacity;
         auto& p2p_extra = seg.GetP2PExtra();
+        p2p_extra.group_id = view.group_id;
         p2p_extra.priority = view.priority;
         p2p_extra.tags = view.tags;
         p2p_extra.memory_type = view.type;
@@ -347,7 +357,8 @@ tl::expected<void, ErrorCode> P2PClientService::RegisterClient() {
 // ============================================================================
 
 tl::expected<void, ErrorCode> P2PClientService::PutLocal(
-    const std::string& key, std::vector<Slice>& slices) {
+    const std::string& key, std::vector<Slice>& slices,
+    std::optional<UUID> tier_id) {
     if (!data_manager_.has_value()) {
         LOG(ERROR) << "DataManager not initialized";
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
@@ -360,7 +371,7 @@ tl::expected<void, ErrorCode> P2PClientService::PutLocal(
         return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
     }
 
-    auto result = data_manager_->Put(key, slices[0]);
+    auto result = data_manager_->Put(key, slices[0], tier_id);
     if (!result && result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
         result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
         VLOG(1) << "Local put failed for key: " << key
@@ -375,7 +386,7 @@ tl::expected<void, ErrorCode> P2PClientService::PutViaRoute(
     const WriteRouteRequestConfig& config) {
     size_t total_size = ClientService::CalculateSliceSize(slices);
 
-    // 1. Get write route from master
+    // Step 1: fetch write route candidates from master.
     WriteRouteRequest route_req;
     route_req.key = key;
     route_req.client_id = client_id_;
@@ -395,14 +406,15 @@ tl::expected<void, ErrorCode> P2PClientService::PutViaRoute(
         return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
-    // 2. Try candidates in order
+    // Step 2: try candidates in order (local fast path first when applicable).
+    // For each chosen candidate, write is executed strictly on the routed tier.
     tl::expected<void, ErrorCode> result;
     for (auto& candidate : candidates) {
         auto& proxy = candidate.replica;
         // Check if locality: is this our own client?
         if (proxy.client_id == client_id_) {
             // Write locally via DataManager
-            result = PutLocal(key, slices);
+            result = PutLocal(key, slices, proxy.segment_id);
             if (!result && result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
                 result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
                 LOG(WARNING)
@@ -430,6 +442,7 @@ tl::expected<void, ErrorCode> P2PClientService::PutViaRoute(
             // memory) and let the remote side pull data.
             RemoteWriteRequest write_req;
             write_req.key = key;
+            write_req.target_tier_id = proxy.segment_id;
             for (const auto& slice : slices) {
                 RemoteBufferDesc buf;
                 buf.segment_endpoint = transfer_engine_->getLocalIpAndPort();
@@ -512,13 +525,15 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
 // ============================================================================
 
 tl::expected<void, ErrorCode> P2PClientService::GetLocal(
-    const std::string& key, std::vector<Slice>& slices) {
+    const std::string& key, std::vector<Slice>& slices,
+    std::optional<UUID> tier_id,
+    std::optional<std::string> segment_group_id) {
     if (!data_manager_.has_value()) {
         LOG(ERROR) << "DataManager not initialized";
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    auto handle = data_manager_->Get(key);
+    auto handle = data_manager_->Get(key, tier_id, segment_group_id);
     if (!handle) {
         VLOG(1) << "Local get miss for key: " << key;
         return tl::unexpected(handle.error());
@@ -546,7 +561,7 @@ tl::expected<void, ErrorCode> P2PClientService::GetLocal(
 
 tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
     const std::string& key, std::vector<Slice>& slices) {
-    // 1. Get replica list from master
+    // Step 1: get logical read route from master.
     auto replica_result = master_client_.GetReplicaList(key);
     if (!replica_result) {
         LOG(ERROR) << "Failed to get replica list for key: " << key;
@@ -559,7 +574,9 @@ tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
         return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    // 2. Try each P2P proxy replica
+    // Step 2: try each routed replica. Each attempt is bound to routed
+    //         segment_id + segment_group_id so remote side can do
+    //         group-aware fallback without crossing group boundary.
     for (auto& replica : replicas) {
         if (!replica.is_p2p_proxy_replica()) {
             LOG(ERROR) << "Replica is not a P2P proxy replica"
@@ -571,7 +588,8 @@ tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
 
         // Check if locality
         if (proxy.client_id == client_id_) {
-            auto local_result = GetLocal(key, slices);
+            auto local_result =
+                GetLocal(key, slices, proxy.segment_id, proxy.segment_group_id);
             if (!local_result) {
                 LOG(WARNING)
                     << "fail to get local via route"
@@ -594,6 +612,8 @@ tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
 
             RemoteReadRequest read_req;
             read_req.key = key;
+            read_req.target_tier_id = proxy.segment_id;
+            read_req.target_segment_group_id = proxy.segment_group_id;
             for (const auto& slice : slices) {
                 RemoteBufferDesc buf;
                 buf.segment_endpoint = transfer_engine_->getLocalIpAndPort();
@@ -631,7 +651,7 @@ tl::expected<void, ErrorCode> P2PClientService::Get(
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
     // Try local first
-    auto local_result = GetLocal(object_key, slices);
+    auto local_result = GetLocal(object_key, slices, std::nullopt);
     if (!local_result) {
         if (local_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to get local data"

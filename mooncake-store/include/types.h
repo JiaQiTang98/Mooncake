@@ -248,11 +248,12 @@ static inline std::string MemoryTypeToString(MemoryType type) {
 }
 
 struct P2PSegmentExtraData {
+    std::string group_id = "default";
     int priority = 0;
     std::vector<std::string> tags;
     MemoryType memory_type = MemoryType::DRAM;
     size_t usage = 0;
-    YLT_REFL(P2PSegmentExtraData, priority, tags, memory_type, usage);
+    YLT_REFL(P2PSegmentExtraData, group_id, priority, tags, memory_type, usage);
 };
 
 /**

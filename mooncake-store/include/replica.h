@@ -161,8 +161,9 @@ struct P2PProxyDescriptor {
     std::string ip_address;
     uint16_t rpc_port = 0;
     uint64_t object_size = 0;
+    std::optional<std::string> segment_group_id;
     YLT_REFL(P2PProxyDescriptor, client_id, segment_id, ip_address, rpc_port,
-             object_size);
+             object_size, segment_group_id);
 };
 
 class Replica {

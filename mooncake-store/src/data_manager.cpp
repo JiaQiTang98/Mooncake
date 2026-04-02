@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -90,12 +91,20 @@ tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
 //    on ref count. Once the method acquire handle successfully, the accessor
 //    can safely access the data until the handle is released.
 tl::expected<AllocationHandle, ErrorCode> DataManager::Get(
-    const std::string& key, std::optional<UUID> tier_id) {
+    const std::string& key, std::optional<UUID> tier_id,
+    std::optional<std::string> segment_group_id) {
     ScopedVLogTimer timer(1, "DataManager::Get");
     timer.LogRequest("key=", key);
 
-    // Get handle from tiered backend
-    auto handle = tiered_backend_->Get(key, tier_id);
+    tl::expected<AllocationHandle, ErrorCode> handle = tl::make_unexpected(
+        ErrorCode::INTERNAL_ERROR);
+    if (segment_group_id.has_value() && !segment_group_id->empty()) {
+        handle = GetFromSegmentGroup(key, *segment_group_id, tier_id);
+    } else {
+        // Get handle from tiered backend
+        handle = tiered_backend_->Get(key, tier_id);
+    }
+
     if (!handle.has_value()) {
         LOG(ERROR) << "Failed to get data for key: " << key;
         timer.LogResponse("error_code=", handle.error());
@@ -104,6 +113,98 @@ tl::expected<AllocationHandle, ErrorCode> DataManager::Get(
 
     timer.LogResponse("error_code=", ErrorCode::OK);
     return handle.value();
+}
+
+tl::expected<AllocationHandle, ErrorCode> DataManager::GetFromSegmentGroup(
+    const std::string& key, const std::string& segment_group_id,
+    std::optional<UUID> preferred_tier_id) {
+    // Step 1: snapshot tiers in the target group and order by priority
+    //         (high -> low) so reads follow group preference.
+    auto tier_views = tiered_backend_->GetTierViews();
+    std::vector<std::pair<int, UUID>> group_tiers;
+    group_tiers.reserve(tier_views.size());
+    for (const auto& view : tier_views) {
+        if (view.group_id == segment_group_id) {
+            group_tiers.emplace_back(view.priority, view.id);
+        }
+    }
+
+    if (group_tiers.empty()) {
+        LOG(ERROR) << "GetFromSegmentGroup: group not found, key=" << key
+                   << ", segment_group_id=" << segment_group_id;
+        return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
+    }
+
+    std::sort(group_tiers.begin(), group_tiers.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  if (lhs.first != rhs.first) {
+                      return lhs.first > rhs.first;
+                  }
+                  return lhs.second < rhs.second;
+              });
+
+    if (preferred_tier_id.has_value()) {
+        auto preferred_it = std::find_if(
+            group_tiers.begin(), group_tiers.end(), [&](const auto& item) {
+                return item.second == *preferred_tier_id;
+            });
+        if (preferred_it == group_tiers.end()) {
+            VLOG(1) << "Preferred tier is not in target segment group, key="
+                    << key << ", preferred_tier_id=" << *preferred_tier_id
+                    << ", segment_group_id=" << segment_group_id;
+        }
+    }
+
+    // Step 2: probe each tier in the group without recording access.
+    // This prevents one logical read request from triggering multiple hotness
+    // updates when it needs fallback across tiers in the same group.
+    std::optional<UUID> hit_tier_id;
+    AllocationHandle hit_handle;
+    for (const auto& [priority, tier] : group_tiers) {
+        (void)priority;
+        auto probe = tiered_backend_->Get(
+            key, tier,
+            /*record_access=*/false);
+        if (probe.has_value()) {
+            hit_tier_id = tier;
+            hit_handle = probe.value();
+            break;
+        }
+
+        if (probe.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            probe.error() == ErrorCode::TIER_NOT_FOUND) {
+            continue;
+        }
+
+        LOG(ERROR) << "GetFromSegmentGroup: probe failed, key=" << key
+                   << ", segment_group_id=" << segment_group_id
+                   << ", tier_id=" << tier
+                   << ", error=" << toString(probe.error());
+        return tl::make_unexpected(probe.error());
+    }
+
+    if (!hit_tier_id.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    // Step 3: record access only once on the final hit tier to preserve
+    // existing "read warms data" semantics.
+    auto final = tiered_backend_->Get(
+        key, *hit_tier_id,
+        /*record_access=*/true);
+    if (final.has_value()) {
+        return final.value();
+    }
+
+    // Step 4: tolerate concurrent movement between probe and final read.
+    if (final.error() == ErrorCode::OBJECT_NOT_FOUND ||
+        final.error() == ErrorCode::TIER_NOT_FOUND) {
+        // The replica changed between probe and final read; continue using the
+        // probed handle to preserve read success.
+        return hit_handle;
+    }
+
+    return tl::make_unexpected(final.error());
 }
 
 tl::expected<void, ErrorCode> DataManager::Delete(const std::string& key,
@@ -136,12 +237,20 @@ std::vector<TierView> DataManager::GetTierViews() const {
 //    on ref count. Once the method acquire handle successfully, the accessor
 //    can safely access the data until the handle is released.
 tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
-    const std::string& key, const std::vector<RemoteBufferDesc>& dest_buffers) {
+    const std::string& key, const std::vector<RemoteBufferDesc>& dest_buffers,
+    std::optional<UUID> tier_id,
+    std::optional<std::string> segment_group_id) {
     ScopedVLogTimer timer(1, "DataManager::ReadRemoteData");
     timer.LogRequest("key=", key, "buffer_count=", dest_buffers.size());
 
     // Step 1: Get data handle from TieredBackend
-    auto handle_result = tiered_backend_->Get(key);
+    tl::expected<AllocationHandle, ErrorCode> handle_result =
+        tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    if (segment_group_id.has_value() && !segment_group_id->empty()) {
+        handle_result = GetFromSegmentGroup(key, *segment_group_id, tier_id);
+    } else {
+        handle_result = tiered_backend_->Get(key, tier_id);
+    }
     if (!handle_result.has_value()) {
         LOG(ERROR) << "ReadRemoteData: Failed to get data for key: " << key
                    << ", error: " << toString(handle_result.error());

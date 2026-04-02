@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <vector>
 #include <limits>
+#include <string_view>
 
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"
@@ -13,6 +14,10 @@
 #include "tiered_cache/scheduler/client_scheduler.h"
 
 namespace mooncake {
+
+namespace {
+constexpr std::string_view kDefaultSegmentGroupId = "default";
+}
 
 AllocationEntry::~AllocationEntry() {
     if (backend && loc.tier) {
@@ -65,6 +70,7 @@ void TieredBackend::Destroy() {
                        std::to_string(id.second);
         segment.size = tier->GetCapacity();
         auto& p2p_extra = segment.GetP2PExtra();
+        p2p_extra.group_id = info.group_id;
         p2p_extra.priority = info.priority;
         p2p_extra.tags = info.tags;
         p2p_extra.memory_type = tier->GetMemoryType();
@@ -127,6 +133,15 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         std::string type = tier_config["type"].asString();
         size_t capacity = tier_config["capacity"].asUInt64();
         int priority = tier_config["priority"].asInt();
+        std::string group_id =
+            tier_config.isMember("segment_group")
+                ? tier_config["segment_group"].asString()
+                : std::string(kDefaultSegmentGroupId);
+
+        if (group_id.empty()) {
+            LOG(ERROR) << "Tier config has empty 'segment_group'";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
         // Validate capacity
         if (capacity == 0) {
@@ -174,6 +189,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             }
             LOG(INFO) << "Creating DRAM tier: id=" << id
                       << ", capacity=" << capacity << ", priority=" << priority
+                      << ", group_id=" << group_id
                       << ", allocator_type=" << allocator_type
                       << (numa_node.has_value()
                               ? ", numa_node=" + std::to_string(*numa_node)
@@ -189,7 +205,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             }
 
             tiers_[id] = std::move(tier);
-            tier_info_[id] = {priority, tags};
+            tier_info_[id] = {priority, tags, group_id};
             memory_type = MemoryType::DRAM;
             LOG(INFO) << "Successfully initialized DRAM tier: id=" << id;
         }
@@ -203,6 +219,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
 
             LOG(INFO) << "Creating ASCEND_NPU tier: id=" << id
                       << ", capacity=" << capacity << ", priority=" << priority
+                      << ", group_id=" << group_id
                       << ", device_id=" << device_id;
 
             auto tier = std::make_unique<AscendCacheTier>(id, capacity, tags,
@@ -215,14 +232,15 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             }
 
             tiers_[id] = std::move(tier);
-            tier_info_[id] = {priority, tags};
+            tier_info_[id] = {priority, tags, group_id};
             memory_type = MemoryType::ASCEND_NPU;
             LOG(INFO) << "Successfully initialized ASCEND_NPU tier: id=" << id;
         }
 #endif
         else if (type == "STORAGE" || type == "DISK") {
             LOG(INFO) << "Creating Storage tier: id=" << id
-                      << ", capacity=" << capacity << ", priority=" << priority;
+                      << ", capacity=" << capacity << ", priority=" << priority
+                      << ", group_id=" << group_id;
             auto tier = std::make_unique<StorageTier>(id, tags, capacity);
             auto init_result = tier->Init(this, engine);
             if (!init_result) {
@@ -231,7 +249,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
                 return tl::unexpected(init_result.error());
             }
             tiers_[id] = std::move(tier);
-            tier_info_[id] = {priority, tags};
+            tier_info_[id] = {priority, tags, group_id};
             memory_type = MemoryType::NVME;
             LOG(INFO) << "Successfully initialized Storage tier: id=" << id;
         } else {
@@ -240,7 +258,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         }
 
         auto mount_result =
-            MountSegment(id, capacity, priority, tags, memory_type);
+            MountSegment(id, capacity, priority, tags, memory_type, group_id);
         if (!mount_result) {
             LOG(ERROR) << "Failed to mount tier: id=" << id
                        << ", error=" << mount_result.error();
@@ -273,7 +291,8 @@ std::vector<UUID> TieredBackend::GetSortedTiers() const {
 
 tl::expected<void, ErrorCode> TieredBackend::MountSegment(
     UUID id, size_t capacity, int priority,
-    const std::vector<std::string>& tags, MemoryType memory_type) {
+    const std::vector<std::string>& tags, MemoryType memory_type,
+    const std::string& group_id) {
     Segment segment;
     segment.extra = P2PSegmentExtraData{};
     segment.id = id;
@@ -281,6 +300,7 @@ tl::expected<void, ErrorCode> TieredBackend::MountSegment(
         "tier_" + std::to_string(id.first) + "_" + std::to_string(id.second);
     segment.size = capacity;
     auto& p2p_extra = segment.GetP2PExtra();
+    p2p_extra.group_id = group_id;
     p2p_extra.priority = priority;
     p2p_extra.tags = tags;
     p2p_extra.memory_type = memory_type;
@@ -831,7 +851,7 @@ std::vector<TierView> TieredBackend::GetTierViews() const {
         size_t cap = tier->GetCapacity();
         size_t used = tier->GetUsage();
         views.push_back({id, tier->GetMemoryType(), cap, used, cap - used,
-                         info.priority, info.tags});
+                         info.group_id, info.priority, info.tags});
     }
     return views;
 }

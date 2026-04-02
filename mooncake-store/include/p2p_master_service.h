@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_set>
+
 #include "master_service.h"
 #include "p2p_client_manager.h"
 #include "p2p_rpc_types.h"
@@ -45,6 +47,21 @@ class P2PMasterService : public MasterService {
         const ObjectMetadata& metadata) override;
 
    protected:
+    struct P2PGroupReplicaMeta {
+        UUID client_id;
+        std::string group_id;
+        std::unordered_set<UUID, boost::hash<UUID>> resident_segments;
+    };
+
+    struct P2PObjectMetadata final : public ObjectMetadata {
+        P2PObjectMetadata(size_t value_length, std::vector<Replica>&& reps,
+                          std::vector<P2PGroupReplicaMeta>&& group_replicas)
+            : ObjectMetadata(value_length, std::move(reps)),
+              group_replicas_(std::move(group_replicas)) {}
+
+        std::vector<P2PGroupReplicaMeta> group_replicas_;
+    };
+
     typedef MetadataShard P2PMetadataShard;
     MetadataShard& GetShard(size_t idx) override {
         return metadata_shards_[idx];
@@ -70,8 +87,27 @@ class P2PMasterService : public MasterService {
     void OnObjectHit(const ObjectMetadata& metadata) override;
     void OnReplicaRemoved(const Replica& replica) override;
     void OnReplicaAdded(const Replica& replica) override;
+    void OnSegmentRemoved(const UUID& segment_id) override;
 
    private:
+    static P2PObjectMetadata& AsP2PObjectMetadata(ObjectMetadata& metadata);
+    static const P2PObjectMetadata& AsP2PObjectMetadata(
+        const ObjectMetadata& metadata);
+
+    auto QueryP2PClient(const UUID& client_id) const
+        -> tl::expected<std::shared_ptr<P2PClientMeta>, ErrorCode>;
+    std::optional<size_t> FindGroupReplicaIndex(
+        const P2PObjectMetadata& metadata, const UUID& client_id,
+        const std::string& group_id) const;
+    auto SelectBestResidentSegment(
+        const std::shared_ptr<P2PClientMeta>& client,
+        const P2PGroupReplicaMeta& group_meta,
+        const P2PGetReplicaListConfigExtra& config) const
+        -> std::shared_ptr<Segment>;
+    static Replica::Descriptor MakeP2PDescriptor(
+        const std::shared_ptr<P2PClientMeta>& client,
+        const std::shared_ptr<Segment>& segment, size_t object_size);
+
     std::shared_ptr<P2PClientManager> client_manager_;
     std::array<P2PMetadataShard, kNumShards> metadata_shards_;
     // for the number of replicas of a key:

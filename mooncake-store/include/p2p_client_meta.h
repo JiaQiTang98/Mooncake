@@ -18,6 +18,8 @@ class P2PClientMeta final : public ClientMeta {
     void UpdateSegmentUsages(const std::vector<TierUsageInfo>& usages);
 
     size_t GetAvailableCapacity() const;
+    auto QuerySegmentGroupId(const UUID& segment_id) const
+        -> tl::expected<std::string, ErrorCode>;
 
     const std::string& get_ip_address() const { return ip_address_; }
     uint16_t get_rpc_port() const { return rpc_port_; }

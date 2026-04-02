@@ -76,7 +76,8 @@ class DataManager {
      *       Access data via handle->loc.data
      */
     tl::expected<AllocationHandle, ErrorCode> Get(
-        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
+        const std::string& key, std::optional<UUID> tier_id = std::nullopt,
+        std::optional<std::string> segment_group_id = std::nullopt);
 
     /**
      * @brief Delete data from tiered storage
@@ -105,7 +106,9 @@ class DataManager {
      */
     tl::expected<void, ErrorCode> ReadRemoteData(
         const std::string& key,
-        const std::vector<RemoteBufferDesc>& dest_buffers);
+        const std::vector<RemoteBufferDesc>& dest_buffers,
+        std::optional<UUID> tier_id = std::nullopt,
+        std::optional<std::string> segment_group_id = std::nullopt);
 
     /**
      * @brief Write data from remote source buffers
@@ -152,6 +155,16 @@ class DataManager {
     tl::expected<void, ErrorCode> TransferDataToRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& dest_buffers);
+
+    /**
+     * @brief Read key within a segment group by tier priority.
+     *        It probes each tier in the same group without recording access,
+     *        then performs one final access on the hit tier to keep existing
+     *        access/hotness semantics.
+     */
+    tl::expected<AllocationHandle, ErrorCode> GetFromSegmentGroup(
+        const std::string& key, const std::string& segment_group_id,
+        std::optional<UUID> preferred_tier_id = std::nullopt);
 
     /**
      * @brief Transfer data from remote source buffers to local allocated space

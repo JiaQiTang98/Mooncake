@@ -29,9 +29,12 @@ struct RemoteReadRequest {
     std::string key;  // Object key to read
     std::vector<RemoteBufferDesc>
         dest_buffers;  // Destination buffers on remote client
+    std::optional<UUID> target_tier_id;
+    std::optional<std::string> target_segment_group_id;
 };
 
-YLT_REFL(RemoteReadRequest, key, dest_buffers);
+YLT_REFL(RemoteReadRequest, key, dest_buffers, target_tier_id,
+         target_segment_group_id);
 
 /**
  * @struct RemoteWriteRequest

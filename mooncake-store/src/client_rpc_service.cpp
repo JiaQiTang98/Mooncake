@@ -37,17 +37,20 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
     }
 
     // Delegate to DataManager
-    auto result =
-        data_manager_.ReadRemoteData(request.key, request.dest_buffers);
+    auto result = data_manager_.ReadRemoteData(
+        request.key, request.dest_buffers, request.target_tier_id,
+        request.target_segment_group_id);
 
     if (!result.has_value()) {
         LOG(ERROR) << "ReadRemoteData failed for key: " << request.key
                    << ", error: " << toString(result.error());
         timer.LogResponse("error_code=", result.error());
 
-        // Rectify stale route when key not found
-        if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-            data_manager_.RectifyReadRoute(request.key);
+        // Rectify stale route when key/tier route is stale.
+        if (result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            result.error() == ErrorCode::TIER_NOT_FOUND) {
+            data_manager_.RectifyReadRoute(request.key,
+                                           request.target_tier_id);
         }
         return result;
     }
