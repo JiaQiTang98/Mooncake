@@ -49,6 +49,36 @@ mooncake_master \
   --enable_metric_reporting=true
 ```
 
+## P2P Real Client Startup Flags (with defaults)
+
+- Basic P2P flags
+  - `--deployment_mode` (str, default `Centralization`): Set to `P2P` to enable P2P client mode.
+  - `--client_rpc_port` (uint32, default `12345`): P2P client RPC listen port.
+  - `--rpc_thread_num` (uint32, default `16`): Number of P2P client RPC worker threads.
+  - `--lock_shard_count` (uint64, default `1024`): Number of key lock shards in DataManager.
+  - `--route_cache_max_memory` (str, default `300 MB`): Max memory budget of RouteCache.
+  - `--route_cache_ttl_ms` (uint64, default `300000`): TTL of RouteCache entries in ms.
+
+- Local async memcpy tuning (P2P local read path)
+  - `--local_copy_async_key_threshold` (uint64, default `2`): Enable async local memcpy in `BatchGet` when batch key count is greater than or equal to this value.
+  - `--local_copy_async_worker_num` (uint64, default `1`): Worker count for local async memcpy executor. Set to `0` to disable async local memcpy.
+  - `--local_copy_async_queue_depth` (uint64, default `1024`): Task queue depth for local async memcpy executor.
+
+Example (P2P real client with async local memcpy enabled):
+
+```bash
+mooncake_client \
+  --deployment_mode=P2P \
+  --host=127.0.0.1 \
+  --metadata_server=http://127.0.0.1:8080/metadata \
+  --master_server_address=127.0.0.1:50051 \
+  --client_rpc_port=12345 \
+  --rpc_thread_num=16 \
+  --local_copy_async_key_threshold=4 \
+  --local_copy_async_worker_num=2 \
+  --local_copy_async_queue_depth=2048
+```
+
 **Tips:**
 
 In addition to command-line flags, the Master also supports configuration via JSON and YAML files. For example:

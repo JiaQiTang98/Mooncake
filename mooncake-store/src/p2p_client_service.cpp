@@ -5,9 +5,94 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <thread>
 
 namespace mooncake {
+
+P2PClientService::AsyncMemcpyExecutor::AsyncMemcpyExecutor(
+    size_t worker_num, size_t max_queue_size)
+    : max_queue_size_(std::max<size_t>(1, max_queue_size)) {
+    workers_.reserve(std::max<size_t>(1, worker_num));
+    for (size_t i = 0; i < std::max<size_t>(1, worker_num); ++i) {
+        workers_.emplace_back(&AsyncMemcpyExecutor::WorkerMain, this);
+    }
+}
+
+P2PClientService::AsyncMemcpyExecutor::~AsyncMemcpyExecutor() { Shutdown(); }
+
+std::future<ErrorCode> P2PClientService::AsyncMemcpyExecutor::Submit(
+    LocalCopyPlan plan) {
+    std::promise<ErrorCode> result;
+    auto future = result.get_future();
+
+    // Step 1: backpressure on bounded queue.
+    std::unique_lock<std::mutex> lock(mutex_);
+    queue_not_full_cv_.wait(
+        lock, [this] { return shutting_down_ || tasks_.size() < max_queue_size_; });
+    if (shutting_down_) {
+        result.set_value(ErrorCode::SHUTTING_DOWN);
+        return future;
+    }
+
+    // Step 2: enqueue task and wake one worker.
+    tasks_.push(CopyTask{std::move(plan), std::move(result)});
+    lock.unlock();
+    queue_not_empty_cv_.notify_one();
+    return future;
+}
+
+void P2PClientService::AsyncMemcpyExecutor::Shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (shutting_down_) {
+            return;
+        }
+        shutting_down_ = true;
+    }
+    queue_not_empty_cv_.notify_all();
+    queue_not_full_cv_.notify_all();
+
+    for (auto& worker : workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    workers_.clear();
+
+    std::queue<CopyTask> pending;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending.swap(tasks_);
+    }
+    while (!pending.empty()) {
+        pending.front().result.set_value(ErrorCode::SHUTTING_DOWN);
+        pending.pop();
+    }
+}
+
+void P2PClientService::AsyncMemcpyExecutor::WorkerMain() {
+    while (true) {
+        CopyTask task;
+        {
+            // Step 1: wait until there is work or shutdown.
+            std::unique_lock<std::mutex> lock(mutex_);
+            queue_not_empty_cv_.wait(
+                lock, [this] { return shutting_down_ || !tasks_.empty(); });
+            if (shutting_down_ && tasks_.empty()) {
+                return;
+            }
+
+            // Step 2: pop one task and release capacity.
+            task = std::move(tasks_.front());
+            tasks_.pop();
+            queue_not_full_cv_.notify_one();
+        }
+
+        // Step 3: execute memcpy and fulfill promise.
+        task.result.set_value(P2PClientService::ExecuteLocalCopyPlan(task.plan));
+    }
+}
 
 // ============================================================================
 // Construction / Destruction
@@ -41,6 +126,10 @@ void P2PClientService::Stop() {
         data_manager_->Stop();
     }
 
+    if (async_memcpy_executor_) {
+        async_memcpy_executor_->Shutdown();
+    }
+
     // Stop heartbeat
     ClientService::Stop();
 
@@ -60,6 +149,7 @@ void P2PClientService::Destroy() {
         data_manager_->Destroy();
     }
     data_manager_.reset();
+    async_memcpy_executor_.reset();
 
     ClientService::Destroy();
 
@@ -177,6 +267,26 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
         config.route_cache_ttl_ms > 0) {
         route_cache_.emplace(config.route_cache_max_memory_bytes,
                              config.route_cache_ttl_ms);
+    }
+
+    // Step 1: load async local-copy knobs from client startup config.
+    local_copy_async_key_threshold_ =
+        std::max<size_t>(1, config.local_copy_async_key_threshold);
+    local_copy_async_worker_num_ = config.local_copy_async_worker_num;
+    local_copy_async_queue_depth_ =
+        std::max<size_t>(1, config.local_copy_async_queue_depth);
+
+    // Step 2: construct (or disable) async executor based on worker count.
+    if (local_copy_async_worker_num_ > 0) {
+        async_memcpy_executor_ = std::make_unique<AsyncMemcpyExecutor>(
+            local_copy_async_worker_num_, local_copy_async_queue_depth_);
+        LOG(INFO) << "P2P local async memcpy enabled, workers="
+                  << local_copy_async_worker_num_
+                  << ", queue_depth=" << local_copy_async_queue_depth_
+                  << ", key_threshold=" << local_copy_async_key_threshold_;
+    } else {
+        async_memcpy_executor_.reset();
+        LOG(INFO) << "P2P local async memcpy disabled because workers=0";
     }
 
     return ErrorCode::OK;
@@ -565,6 +675,109 @@ P2PClientService::QueryReplicaSize(const std::string& key,
     return std::make_pair(std::move(replicas), total_size);
 }
 
+tl::expected<P2PClientService::LocalCopyPlan, ErrorCode>
+P2PClientService::BuildLocalCopyPlan(const std::string& key,
+                                     const AllocationHandle& handle,
+                                     const std::vector<Slice>& slices) const {
+    if (!handle) {
+        LOG(ERROR) << "Invalid local allocation handle for key: " << key;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    const auto& loc = handle->loc;
+    if (!loc.data.buffer) {
+        LOG(ERROR) << "Allocation handle has null buffer for key: " << key;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    const char* src = reinterpret_cast<const char*>(loc.data.buffer->data());
+    const size_t src_size = loc.data.buffer->size();
+    const size_t provided_size = ClientService::CalculateSliceSize(slices);
+    if (provided_size < src_size) {
+        LOG(ERROR) << "Buffer too small for local key '" << key
+                   << "': required=" << src_size
+                   << ", provided=" << provided_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    LocalCopyPlan plan;
+    plan.source_handle = handle;
+    plan.source_ptr = src;
+    plan.source_size = src_size;
+    plan.dest_slices = slices;
+    return plan;
+}
+
+ErrorCode P2PClientService::ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
+    size_t offset = 0;
+    for (const auto& slice : plan.dest_slices) {
+        if (offset >= plan.source_size) {
+            break;
+        }
+
+        const size_t copy_size = std::min(slice.size, plan.source_size - offset);
+        if (copy_size == 0) {
+            continue;
+        }
+
+        if (!slice.ptr) {
+            LOG(ERROR) << "Local copy destination buffer is null";
+            return ErrorCode::INVALID_PARAMS;
+        }
+
+        std::memcpy(slice.ptr, plan.source_ptr + offset, copy_size);
+        offset += copy_size;
+    }
+
+    if (offset != plan.source_size) {
+        LOG(ERROR) << "Local copy did not complete, copied=" << offset
+                   << ", source_size=" << plan.source_size;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+tl::expected<size_t, ErrorCode> P2PClientService::RunLocalCopy(
+    const std::string& key, const AllocationHandle& handle,
+    const std::vector<Slice>& slices, size_t batch_key_count) {
+    // Step 1: validate source/destination and materialize a copy plan.
+    auto plan_result = BuildLocalCopyPlan(key, handle, slices);
+    if (!plan_result) {
+        return tl::unexpected(plan_result.error());
+    }
+
+    auto plan = std::move(plan_result.value());
+    const size_t source_size = plan.source_size;
+
+    // Step 2: when batch key count crosses threshold, use async queue.
+    if (ShouldUseAsyncLocalCopy(batch_key_count)) {
+        auto copy_future = async_memcpy_executor_->Submit(std::move(plan));
+        ErrorCode copy_result = ErrorCode::INTERNAL_ERROR;
+        try {
+            copy_result = copy_future.get();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Async local copy failed with exception: " << e.what();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        if (copy_result != ErrorCode::OK) {
+            return tl::unexpected(copy_result);
+        }
+        return source_size;
+    }
+
+    // Step 3: synchronous memcpy fallback path.
+    const ErrorCode copy_result = ExecuteLocalCopyPlan(plan);
+    if (copy_result != ErrorCode::OK) {
+        return tl::unexpected(copy_result);
+    }
+    return source_size;
+}
+
+bool P2PClientService::ShouldUseAsyncLocalCopy(size_t batch_key_count) const {
+    return async_memcpy_executor_ != nullptr &&
+           batch_key_count >= local_copy_async_key_threshold_;
+}
+
 std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
 P2PClientService::BatchGet(const std::vector<std::string>& keys,
                            std::shared_ptr<ClientBufferAllocator> allocator,
@@ -580,9 +793,94 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
         return results;
     }
 
-    // Process each key: try local first, then batch remote
+    struct PendingLocalCopy {
+        size_t index = 0;
+        std::future<ErrorCode> copy_future;
+        std::shared_ptr<BufferHandle> output_handle;
+    };
+
+    std::vector<PendingLocalCopy> pending_local_copies;
+    std::vector<size_t> fallback_indices;
+    pending_local_copies.reserve(keys.size());
+    fallback_indices.reserve(keys.size());
+
+    // Step 1: detect local hits and submit local copies (sync/async).
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = Get(keys[i], allocator, config);
+        if (!data_manager_.has_value()) {
+            fallback_indices.push_back(i);
+            continue;
+        }
+
+        auto guard = AcquireInflightGuard();
+        if (!guard.is_valid()) {
+            results[i] = tl::unexpected(ErrorCode::SHUTTING_DOWN);
+            continue;
+        }
+
+        auto local_handle = data_manager_->Get(keys[i]);
+        if (!local_handle || !local_handle.value()->loc.data.buffer) {
+            fallback_indices.push_back(i);
+            continue;
+        }
+
+        const size_t local_size = local_handle.value()->loc.data.buffer->size();
+        auto alloc_result = allocator->allocate(local_size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate buffer for local batch get, key: "
+                       << keys[i];
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+
+        auto output_handle =
+            std::make_shared<BufferHandle>(std::move(*alloc_result));
+        std::vector<Slice> local_slices = {
+            Slice{output_handle->ptr(), local_size}};
+        auto plan_result =
+            BuildLocalCopyPlan(keys[i], local_handle.value(), local_slices);
+        if (!plan_result) {
+            // For allocator-based Get, local copy failure is fatal and does not
+            // fallback to remote.
+            results[i] = tl::unexpected(plan_result.error());
+            continue;
+        }
+
+        auto plan = std::move(plan_result.value());
+        if (ShouldUseAsyncLocalCopy(keys.size())) {
+            pending_local_copies.push_back(
+                PendingLocalCopy{i, async_memcpy_executor_->Submit(std::move(plan)),
+                                 std::move(output_handle)});
+            continue;
+        }
+
+        ErrorCode copy_result = ExecuteLocalCopyPlan(plan);
+        if (copy_result != ErrorCode::OK) {
+            results[i] = tl::unexpected(copy_result);
+            continue;
+        }
+        results[i] = std::move(output_handle);
+    }
+
+    // Step 2: process local misses via existing per-key Get flow.
+    for (size_t idx : fallback_indices) {
+        results[idx] = Get(keys[idx], allocator, config);
+    }
+
+    // Step 3: wait for async local copies and finalize results.
+    for (auto& pending : pending_local_copies) {
+        ErrorCode copy_result = ErrorCode::INTERNAL_ERROR;
+        try {
+            copy_result = pending.copy_future.get();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Async local batch get copy failed: " << e.what();
+            copy_result = ErrorCode::INTERNAL_ERROR;
+        }
+
+        if (copy_result != ErrorCode::OK) {
+            results[pending.index] = tl::unexpected(copy_result);
+            continue;
+        }
+        results[pending.index] = std::move(pending.output_handle);
     }
 
     return results;
@@ -619,9 +917,15 @@ tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
                 }
 
                 auto buffer_handle = std::move(*alloc_result);
-                const char* src =
-                    reinterpret_cast<const char*>(loc.data.buffer->data());
-                std::memcpy(buffer_handle.ptr(), src, local_size);
+                std::vector<Slice> local_slices = {
+                    Slice{buffer_handle.ptr(), local_size}};
+                auto local_copy_result =
+                    RunLocalCopy(key, handle.value(), local_slices);
+                if (!local_copy_result) {
+                    LOG(ERROR) << "Failed local copy for key: " << key
+                               << ", error: " << local_copy_result.error();
+                    return tl::unexpected(local_copy_result.error());
+                }
                 return std::make_shared<BufferHandle>(std::move(buffer_handle));
             }
         }
@@ -708,11 +1012,93 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    std::vector<tl::expected<int64_t, ErrorCode>> results;
-    results.reserve(keys.size());
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+
+    struct PendingLocalCopy {
+        size_t index = 0;
+        size_t source_size = 0;
+        std::future<ErrorCode> copy_future;
+    };
+
+    std::vector<PendingLocalCopy> pending_local_copies;
+    std::vector<size_t> fallback_indices;
+    pending_local_copies.reserve(keys.size());
+    fallback_indices.reserve(keys.size());
+
+    // Step 1: attempt local copy for each key and submit async tasks for large
+    // payloads.
     for (size_t i = 0; i < keys.size(); ++i) {
-        results.push_back(Get(keys[i], all_buffers[i], all_sizes[i], config));
+        if (!data_manager_.has_value()) {
+            fallback_indices.push_back(i);
+            continue;
+        }
+
+        auto guard = AcquireInflightGuard();
+        if (!guard.is_valid()) {
+            results[i] = tl::unexpected(ErrorCode::SHUTTING_DOWN);
+            continue;
+        }
+
+        std::vector<Slice> local_slices;
+        local_slices.reserve(all_buffers[i].size());
+        for (size_t j = 0; j < all_buffers[i].size(); ++j) {
+            local_slices.emplace_back(Slice{all_buffers[i][j], all_sizes[i][j]});
+        }
+
+        auto local_handle = data_manager_->Get(keys[i]);
+        if (!local_handle || !local_handle.value()->loc.data.buffer) {
+            fallback_indices.push_back(i);
+            continue;
+        }
+
+        auto plan_result =
+            BuildLocalCopyPlan(keys[i], local_handle.value(), local_slices);
+        if (!plan_result) {
+            // Get(key, buffers, sizes) falls back to remote on local errors.
+            fallback_indices.push_back(i);
+            continue;
+        }
+
+        auto plan = std::move(plan_result.value());
+        if (ShouldUseAsyncLocalCopy(keys.size())) {
+            pending_local_copies.push_back(PendingLocalCopy{
+                i, plan.source_size, async_memcpy_executor_->Submit(std::move(plan))});
+            continue;
+        }
+
+        ErrorCode copy_result = ExecuteLocalCopyPlan(plan);
+        if (copy_result == ErrorCode::OK) {
+            results[i] = static_cast<int64_t>(plan.source_size);
+        } else {
+            fallback_indices.push_back(i);
+        }
     }
+
+    // Step 2: fallback keys use the original Get path (local+remote logic).
+    for (size_t idx : fallback_indices) {
+        results[idx] = Get(keys[idx], all_buffers[idx], all_sizes[idx], config);
+    }
+
+    // Step 3: collect async local-copy completions.
+    for (auto& pending : pending_local_copies) {
+        ErrorCode copy_result = ErrorCode::INTERNAL_ERROR;
+        try {
+            copy_result = pending.copy_future.get();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Async local batch get copy failed: " << e.what();
+            copy_result = ErrorCode::INTERNAL_ERROR;
+        }
+
+        if (copy_result == ErrorCode::OK) {
+            results[pending.index] = static_cast<int64_t>(pending.source_size);
+        } else {
+            results[pending.index] =
+                Get(keys[pending.index], all_buffers[pending.index],
+                    all_sizes[pending.index], config);
+        }
+    }
+
     return results;
 }
 
@@ -820,34 +1206,7 @@ tl::expected<size_t, ErrorCode> P2PClientService::GetLocal(
         return tl::unexpected(handle.error());
     }
 
-    // Copy data from handle to slices
-    auto& loc = handle.value()->loc;
-    if (!loc.data.buffer) {
-        LOG(ERROR) << "Allocation handle has null buffer for key: " << key;
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    const char* src = reinterpret_cast<const char*>(loc.data.buffer->data());
-    size_t src_size = loc.data.buffer->size();
-
-    // Verify provided slices are large enough
-    size_t provided_size = ClientService::CalculateSliceSize(slices);
-    if (provided_size < src_size) {
-        LOG(ERROR) << "Buffer too small for local key '" << key
-                   << "': required=" << src_size
-                   << ", provided=" << provided_size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    size_t offset = 0;
-    for (auto& slice : slices) {
-        size_t copy_size = std::min(slice.size, src_size - offset);
-        if (copy_size > 0) {
-            std::memcpy(slice.ptr, src + offset, copy_size);
-            offset += copy_size;
-        }
-        if (offset >= src_size) break;
-    }
-    return src_size;
+    return RunLocalCopy(key, handle.value(), slices);
 }
 
 tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(

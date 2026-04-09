@@ -1,8 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <future>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <thread>
 
 #include "client_service.h"
@@ -244,6 +247,56 @@ class P2PClientService final : public ClientService {
     tl::expected<size_t, ErrorCode> GetLocal(const std::string& key,
                                              std::vector<Slice>& slices);
 
+    struct LocalCopyPlan {
+        // Keep source handle alive until memcpy finishes.
+        AllocationHandle source_handle;
+        // Source memory view from local TieredBackend object.
+        const char* source_ptr = nullptr;
+        size_t source_size = 0;
+        // Caller-provided destination slices.
+        std::vector<Slice> dest_slices;
+    };
+
+    class AsyncMemcpyExecutor {
+       public:
+        AsyncMemcpyExecutor(size_t worker_num, size_t max_queue_size);
+        ~AsyncMemcpyExecutor();
+
+        std::future<ErrorCode> Submit(LocalCopyPlan plan);
+        void Shutdown();
+
+       private:
+        struct CopyTask {
+            LocalCopyPlan plan;
+            std::promise<ErrorCode> result;
+        };
+
+        // Long-running worker loop consuming submitted local copy tasks.
+        void WorkerMain();
+
+        size_t max_queue_size_ = 0;
+        bool shutting_down_ = false;
+        std::mutex mutex_;
+        std::condition_variable queue_not_empty_cv_;
+        std::condition_variable queue_not_full_cv_;
+        std::queue<CopyTask> tasks_;
+        std::vector<std::thread> workers_;
+    };
+    friend class AsyncMemcpyExecutor;
+
+    tl::expected<LocalCopyPlan, ErrorCode> BuildLocalCopyPlan(
+        const std::string& key, const AllocationHandle& handle,
+        const std::vector<Slice>& slices) const;
+    // Execute one local copy plan synchronously in the current thread.
+    static ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan);
+    // Unified local copy entry: validate, choose sync/async path by batch key
+    // count, then return bytes.
+    tl::expected<size_t, ErrorCode> RunLocalCopy(const std::string& key,
+                                                 const AllocationHandle& handle,
+                                                 const std::vector<Slice>& slices,
+                                                 size_t batch_key_count = 1);
+    bool ShouldUseAsyncLocalCopy(size_t batch_key_count) const;
+
     /**
      * @brief Get data from a remote node via a list of proxy descriptors.
      * Iterates through the list; stops, returns the slice of proxies from the
@@ -282,6 +335,12 @@ class P2PClientService final : public ClientService {
 
     // Route cache for reducing Master query pressure
     std::optional<RouteCache> route_cache_;
+
+    // Async local copy configuration
+    size_t local_copy_async_key_threshold_ = 2;
+    size_t local_copy_async_worker_num_ = 1;
+    size_t local_copy_async_queue_depth_ = 1024;
+    std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
 };
 
 }  // namespace mooncake

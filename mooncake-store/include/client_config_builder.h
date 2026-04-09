@@ -135,6 +135,13 @@ struct P2PClientConfig : RealClientConfigBase {
     // + P2PRouteData(each item is 96B and count is 8B)
     size_t route_cache_max_memory_bytes = 300 * 1024 * 1024;  // 300MB
     uint64_t route_cache_ttl_ms = 5 * 60 * 1000;              // 5min
+
+    // Async local memcpy configuration for P2P local read path.
+    // If batch key count >= local_copy_async_key_threshold, local memcpy tasks
+    // in BatchGet are submitted asynchronously.
+    size_t local_copy_async_key_threshold = 2;
+    size_t local_copy_async_worker_num = 1;
+    size_t local_copy_async_queue_depth = 1024;
 };
 
 // ============================================================================
@@ -192,6 +199,9 @@ class ClientConfigBuilder {
         size_t lock_shard_count = 1024,
         size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
         uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
+        size_t local_copy_async_key_threshold = 2,
+        size_t local_copy_async_worker_num = 1,
+        size_t local_copy_async_queue_depth = 1024,
         const std::map<std::string, std::string>& labels = {}) {
         P2PClientConfig config;
         fill_real_client_config_base(
@@ -203,6 +213,9 @@ class ClientConfigBuilder {
         config.lock_shard_count = lock_shard_count;
         config.route_cache_max_memory_bytes = route_cache_max_memory_bytes;
         config.route_cache_ttl_ms = route_cache_ttl_ms;
+        config.local_copy_async_key_threshold = local_copy_async_key_threshold;
+        config.local_copy_async_worker_num = local_copy_async_worker_num;
+        config.local_copy_async_queue_depth = local_copy_async_queue_depth;
 
         Json::Value tiered_config;
         std::string actual_json = tiered_backend_config_json;
