@@ -12,38 +12,45 @@ variables before running this script.
 
 Usage:
 ------
-1. Mode Selection:
-   Use --mode to choose Centralization, P2P, or both (default: both).
-   Example: python3 stress_single_workload_runner.py --mode Centralization --threads 8 --value_size 1048576
+# Single comparison run (Centralization vs P2P) with batch=4:
+  python3 stress_single_workload_runner.py --mode both --threads 8 --value_size 1048576 --batch 4
 
-2. Matrix Sweep:
-   Enabled with the --matrix flag. Supports comma-separated lists for key dimensions.
-   Example: python3 stress_single_workload_runner.py --matrix --threads 4,8,16 --value_size 1048576,4194304 --output results.csv
-   Note: Matrix mode automatically iterates through all combinations (Cartesian product).
+# P2P only, sweep async worker counts:
+  python3 stress_single_workload_runner.py --mode P2P --threads 8 --value_size 1048576 --async_workers 1,4,8
 
-Core Arguments:
---------------
---mode: [Centralization, P2P, both] (default: both)
---rounds: Number of rounds per configuration to average (default: 5)
---ops: Number of operations per thread, supports lists like "100,200" (default: 100)
---threads: Number of worker threads, supports lists like "4,8,16"
---value_size: Value size in bytes, supports lists like "1048576,4194304"
---rpc_threads: Master RPC thread count, supports lists like "4,16,32"
+# Matrix sweep: all combinations of threads/value_size/batch, save to CSV:
+  python3 stress_single_workload_runner.py --matrix --threads 4,8,16 --value_size 1048576,4194304 \
+      --batch 1,4 --async_threshold 2,8 --async_workers 1,4 --output results.csv
+
+Arguments:
+----------
+--mode:              [Centralization, P2P, both] (default: both)
+--rounds:            Number of rounds per configuration to average (default: 5)
+--ops:               Number of operations per thread, supports lists like "100,200" (default: 100)
+--threads:           Number of worker threads, supports lists like "4,8,16"
+--value_size:        Value size in bytes, supports lists like "1048576,4194304"
+--rpc_threads:       Master RPC thread count, supports lists like "4,16,32"
+--batch:             Batch size for read/write operations, supports lists like "1,4,16" (default: 1)
 --ram_buffer_size_gb: Client's RAM buffer size in GB, supports lists like "8,16" (default: 15)
---output: Path to save results (.csv or .json)
+--output:            Path to save results (.csv or .json)
+--matrix:            Enable matrix sweep mode (Cartesian product over all list-valued arguments)
+
+P2P-Specific (ignored in Centralization mode):
+----------------------------------------------
+--async_threshold:   Min key count to trigger async copy, supports lists like "2,8,256" (default: 2)
+--async_workers:     Number of async copy worker threads, supports lists like "1,4,8" (default: 4)
+--async_queue_depth: Async copy task queue depth, supports lists like "256,1024" (default: 1024)
 """
 
 import subprocess
 import time
 import re
 import os
-import signal
 import statistics
 import argparse
 import json
 import csv
 import itertools
-from datetime import datetime
 
 # --- Configuration ---
 # PROJECT_ROOT points to the repository root directory (two levels up from mooncake-store/tests/)
@@ -111,7 +118,8 @@ def parse_metrics(output):
             
     return metrics
 
-def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb):
+def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb, 
+                         batch=1, async_threshold=2, async_workers=1, async_queue_depth=1024):
     """Run a specific configuration for a single mode."""
     kill_existing_processes()
     
@@ -121,7 +129,12 @@ def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ra
     
     all_rounds_metrics = []
     for r in range(1, rounds + 1):
-        test_cmd = f"{TEST_BIN} --client_type={mode} --num_threads={threads} --value_size={value_size} --test_operation_nums={ops} --ram_buffer_size_gb={ram_buffer_size_gb}"
+        test_cmd = (f"{TEST_BIN} --client_type={mode} --num_threads={threads} --value_size={value_size} "
+                    f"--test_operation_nums={ops} --ram_buffer_size_gb={ram_buffer_size_gb} --batch_size={batch}")
+        
+        if mode == "P2P":
+            test_cmd += f" --async_copy_threshold={async_threshold} --async_copy_worker_num={async_workers} --async_copy_queue_depth={async_queue_depth}"
+            
         output = run_command(test_cmd)
         metrics = parse_metrics(output)
         if metrics:
@@ -161,7 +174,13 @@ def main():
     parser.add_argument("--threads", type=str, default="8", help="Worker threads (list: 4,8,16)")
     parser.add_argument("--value_size", type=str, default="1048576", help="Value size in bytes (list: 1048576,4194304)")
     parser.add_argument("--rpc_threads", type=str, default="32", help="RPC threads (list: 4,16,32)")
+    parser.add_argument("--batch", type=str, default="1", help="Batch size (list: 1,4,16)")
     parser.add_argument("--ram_buffer_size_gb", type=str, default="15", help="RAM buffer size in GB (list: 8,16,32)")
+    
+    # P2P Specific async copy parameters
+    parser.add_argument("--async_threshold", type=str, default="2", help="Async copy threshold (P2P only, list: 2,8,256)")
+    parser.add_argument("--async_workers", type=str, default="4", help="Async copy workers (P2P only, list: 1,4,8)")
+    parser.add_argument("--async_queue_depth", type=str, default="1024", help="Async copy queue depth (P2P only, list: 256,1024)")
     
     # Flags
     parser.add_argument("--matrix", action="store_true", help="Enable matrix sweep mode")
@@ -177,51 +196,87 @@ def main():
     ram_list = parse_list_arg(args.ram_buffer_size_gb)
     modes = ["Centralization", "P2P"] if args.mode == "both" else [args.mode]
     
-    # Define dimensions for the sweep
-    # We group external dimensions (size, rpc_th, threads) to allow easy comparison of modes (Centralization vs P2P)
-    sweep_dims = {
+    # Global sweep dims (apply to all modes)
+    base_sweep_dims = {
         "value_size": value_list,
         "rpc_threads": rpc_threads_list,
         "threads": threads_list,
         "ops": ops_list,
         "ram_buffer_size_gb": ram_list,
+        "batch": parse_list_arg(args.batch),
     }
-    dim_keys = list(sweep_dims.keys())
-    dim_combinations = list(itertools.product(*sweep_dims.values()))
-    
+
+    # P2P specific sweep dims
+    p2p_extra_dims = {
+        "async_threshold": parse_list_arg(args.async_threshold),
+        "async_workers": parse_list_arg(args.async_workers),
+        "async_queue_depth": parse_list_arg(args.async_queue_depth),
+    }
+
     results = []
     
-    total_configs = len(modes) * len(dim_combinations)
+    # Logic: Iterating through external configurations
+    # For each config, if Centralization is requested, run it once (ignoring P2P dims)
+    # If P2P is requested, run it for all combinations of P2P dims
+    
+    base_keys = list(base_sweep_dims.keys())
+    base_combinations = list(itertools.product(*base_sweep_dims.values()))
+    
+    p2p_keys = list(p2p_extra_dims.keys())
+    p2p_combinations = list(itertools.product(*p2p_extra_dims.values()))
+
+    total_runs = 0
+    if "Centralization" in modes:
+        total_runs += len(base_combinations)
+    if "P2P" in modes:
+        for base_combo in base_combinations:
+            base_cfg_tmp = dict(zip(base_keys, base_combo))
+            total_runs += 1 if base_cfg_tmp["batch"] == 1 else len(p2p_combinations)
+
     current = 0
-    
     print(f"Starting {('matrix' if args.matrix else 'comparison')} benchmark...")
-    print(f"Total configurations to test: {total_configs}")
+    print(f"Total configurations to test: {total_runs}")
     
-    for combo in dim_combinations:
-        # Unpack configuration
-        cfg = dict(zip(dim_keys, combo))
-        v_size, r_th, th, ops, r_buf_gb = cfg["value_size"], cfg["rpc_threads"], cfg["threads"], cfg["ops"], cfg["ram_buffer_size_gb"]
+    for base_combo in base_combinations:
+        base_cfg = dict(zip(base_keys, base_combo))
+        v_size, r_th, th, ops, r_buf_gb, batch = [base_cfg[k] for k in base_keys]
         
         config_results = {}
-        for m in modes:
-            current += 1
-            print(f"[{current}/{total_configs}] Testing: mode={m}, threads={th}, val={v_size/1024/1024:.1f}MB, rpc_th={r_th}, ops={ops}, buffer={r_buf_gb}GB...")
-            
-            avg = run_benchmark_config(m, args.rounds, th, v_size, ops, r_th, r_buf_gb)
-            if avg:
-                entry = {
-                    "mode": m,
-                    "threads": th,
-                    "value_size": v_size,
-                    "rpc_threads": r_th,
-                    "ops": ops,
-                    "ram_buffer_size_gb": r_buf_gb,
-                    **avg
-                }
-                results.append(entry)
-                config_results[m] = avg
         
-        # If not matrix mode and we have both results, print a comparison table for this config
+        # 1. Run Centralization
+        if "Centralization" in modes:
+            current += 1
+            print(f"\n[{current}/{total_runs}] Testing: mode=Centralization")
+            print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
+            avg = run_benchmark_config("Centralization", args.rounds, th, v_size, ops, r_th, r_buf_gb, batch=batch)
+            if avg:
+                entry = {"mode": "Centralization", **base_cfg, **avg}
+                results.append(entry)
+                config_results["Centralization"] = avg
+                print_single_result("Centralization", avg)
+
+        # 2. Run P2P with all extra dims (skip async param sweep when batch=1)
+        if "P2P" in modes:
+            active_p2p_combinations = [p2p_combinations[0]] if batch == 1 else p2p_combinations
+            for p2p_combo in active_p2p_combinations:
+                current += 1
+                p2p_cfg = dict(zip(p2p_keys, p2p_combo))
+                a_th, a_wk, a_qd = [p2p_cfg[k] for k in p2p_keys]
+
+                print(f"\n[{current}/{total_runs}] Testing: mode=P2P")
+                print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
+                if batch > 1:
+                    print(f"    async_threshold={a_th}, async_workers={a_wk}, async_queue_depth={a_qd}")
+
+                avg = run_benchmark_config("P2P", args.rounds, th, v_size, ops, r_th, r_buf_gb,
+                                           batch=batch, async_threshold=a_th, async_workers=a_wk, async_queue_depth=a_qd)
+                if avg:
+                    entry = {"mode": "P2P", **base_cfg, **(p2p_cfg if batch > 1 else {}), **avg}
+                    results.append(entry)
+                    config_results["P2P"] = avg # Note: only last p2p result is kept for print_comparison_table
+                    print_single_result("P2P", avg)
+
+        # If comparison mode (single combo), we just show the comparison of Centralization vs LAST P2P run
         if not args.matrix and "Centralization" in config_results and "P2P" in config_results:
             print_comparison_table(th, v_size, r_th, ops, r_buf_gb, config_results, args.rounds)
 
@@ -232,6 +287,12 @@ def main():
     # Save output
     if args.output and results:
         save_results(results, args.output)
+
+def print_single_result(mode, avg):
+    print(f"    [{mode}] PUT: {avg['put_throughput']:.1f} MB/s  GET: {avg['get_throughput']:.1f} MB/s  "
+          f"Ops/s: {avg['ops_sec']:.1f}  Success: {avg['success_rate']:.1f}%  "
+          f"PUT P50/P99: {avg['put_p50']:.1f}/{avg['put_p99']:.1f} us  "
+          f"GET P50/P99: {avg['get_p50']:.1f}/{avg['get_p99']:.1f} us")
 
 def print_comparison_table(threads, value_size, rpc_threads, ops, ram_buffer_size_gb, results, rounds):
     print("\n" + "="*80)
@@ -262,22 +323,24 @@ def print_comparison_table(threads, value_size, rpc_threads, ops, ram_buffer_siz
     print("=" * 80 + "\n")
 
 def print_matrix_summary(results):
-    print("\n" + "="*160)
+    print("\n" + "="*180)
     print("MATRIX SWEEP SUMMARY")
-    print("-" * 160)
-    # Header with PUT and GET latency columns
-    latency_hdr = " | ".join([f"{'P-P50':<6} {'P-P70':<6} {'P-P90':<6} {'P-P99':<6}", 
-                               f"{'G-P50':<6} {'G-P70':<6} {'G-P90':<6} {'G-P99':<6}"])
-    header = f"{'Mode':<15} | {'Th':<3} | {'Val(MB)':<7} | {'RPC':<3} | {'Ops':<5} | {'Buf':<3} | {'Success%':<8} | {'PUT-MB/s':<10} | {'GET-MB/s':<10} | {latency_hdr}"
+    print("-" * 180)
+    latency_hdr = " | ".join([f"{'P-P50':<6} {'P-P90':<6} {'P-P99':<6}",
+                               f"{'G-P50':<6} {'G-P90':<6} {'G-P99':<6}"])
+    header = f"{'Mode':<15} | {'Th':<3} | {'Bch':<3} | {'Val(MB)':<7} | {'RPC':<3} | {'Ops':<5} | {'Buf':<3} | {'A-Th':<5} | {'A-Wk':<4} | {'A-QD':<5} | {'PUT-MB/s':<10} | {'GET-MB/s':<10} | {latency_hdr}"
     print(header)
     print("-" * 180)
     for r in results:
-        put_lat = f"{r['put_p50']:<6.1f} {r['put_p70']:<6.1f} {r['put_p90']:<6.1f} {r['put_p99']:<6.1f}"
-        get_lat = f"{r['get_p50']:<6.1f} {r['get_p70']:<6.1f} {r['get_p90']:<6.1f} {r['get_p99']:<6.1f}"
-        print(f"{r['mode']:<15} | {r['threads']:<3} | {r['value_size']/1024/1024:<7.1f} | {r['rpc_threads']:<3} | {r['ops']:<5} | {r['ram_buffer_size_gb']:<3} | "
-              f"{r['success_rate']:<8.1f} | {r['put_throughput']:<10.1f} | {r['get_throughput']:<10.1f} | "
+        put_lat = f"{r['put_p50']:<6.1f} {r['put_p90']:<6.1f} {r['put_p99']:<6.1f}"
+        get_lat = f"{r['get_p50']:<6.1f} {r['get_p90']:<6.1f} {r['get_p99']:<6.1f}"
+        a_th = str(r.get('async_threshold', '-'))
+        a_wk = str(r.get('async_workers', '-'))
+        a_qd = str(r.get('async_queue_depth', '-'))
+        print(f"{r['mode']:<15} | {r['threads']:<3} | {r.get('batch', 1):<3} | {r['value_size']/1024/1024:<7.1f} | {r['rpc_threads']:<3} | {r['ops']:<5} | {r['ram_buffer_size_gb']:<3} | "
+              f"{a_th:<5} | {a_wk:<4} | {a_qd:<5} | {r['put_throughput']:<10.1f} | {r['get_throughput']:<10.1f} | "
               f"{put_lat} | {get_lat}")
-    print("=" * 160 + "\n")
+    print("=" * 180 + "\n")
 
 def save_results(results, path):
     print(f"Saving results to {path}...")
@@ -286,9 +349,16 @@ def save_results(results, path):
             json.dump(results, f, indent=2)
     elif path.endswith(".csv"):
         if not results: return
-        keys = results[0].keys()
+        # Collect all unique keys in insertion order across all rows (P2P rows have extra fields)
+        seen = set()
+        keys = []
+        for r in results:
+            for k in r.keys():
+                if k not in seen:
+                    keys.append(k)
+                    seen.add(k)
         with open(path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
+            writer = csv.DictWriter(f, fieldnames=keys, restval='')
             writer.writeheader()
             writer.writerows(results)
     else:

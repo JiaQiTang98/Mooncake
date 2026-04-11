@@ -253,26 +253,54 @@ class P2PClientService final : public ClientService {
         // Source memory view from local TieredBackend object.
         const char* source_ptr = nullptr;
         size_t source_size = 0;
+        // Fast path for one contiguous destination slice (the common case in
+        // stress workload and allocator-based Get).
+        bool use_single_dest = false;
+        void* single_dest_ptr = nullptr;
+        size_t single_dest_size = 0;
         // Caller-provided destination slices.
         std::vector<Slice> dest_slices;
     };
 
     class AsyncMemcpyExecutor {
        public:
+        struct BatchState {
+            std::vector<ErrorCode> results;
+            std::atomic<size_t> remaining{0};
+            std::mutex done_mutex;
+            std::condition_variable done_cv;
+            bool done = false;
+        };
+
+        struct BatchHandle {
+            std::shared_ptr<BatchState> state;
+            std::vector<ErrorCode> Wait() const;
+        };
+
         AsyncMemcpyExecutor(size_t worker_num, size_t max_queue_size);
         ~AsyncMemcpyExecutor();
 
         std::future<ErrorCode> Submit(LocalCopyPlan plan);
+
+        // Submit batch copy plans and return one completion handle for the
+        // entire batch, avoiding per-key future allocation overhead.
+        BatchHandle SubmitBatch(std::vector<LocalCopyPlan> plans);
+
         void Shutdown();
 
        private:
         struct CopyTask {
             LocalCopyPlan plan;
             std::promise<ErrorCode> result;
+            std::shared_ptr<BatchState> batch_state;
+            size_t batch_index = 0;
+            bool is_batch = false;
         };
 
         // Long-running worker loop consuming submitted local copy tasks.
         void WorkerMain();
+        static void FinishBatchTask(const std::shared_ptr<BatchState>& state,
+                                    size_t batch_index, ErrorCode result);
 
         size_t max_queue_size_ = 0;
         bool shutting_down_ = false;

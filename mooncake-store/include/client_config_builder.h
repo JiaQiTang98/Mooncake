@@ -140,7 +140,7 @@ struct P2PClientConfig : RealClientConfigBase {
     // If batch key count >= local_copy_async_key_threshold, local memcpy tasks
     // in BatchGet are submitted asynchronously.
     size_t local_copy_async_key_threshold = 2;
-    size_t local_copy_async_worker_num = 1;
+    size_t local_copy_async_worker_num = 4;
     size_t local_copy_async_queue_depth = 1024;
 };
 
