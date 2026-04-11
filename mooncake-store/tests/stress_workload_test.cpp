@@ -134,10 +134,23 @@ bool initialize_client() {
     std::optional<std::shared_ptr<ClientService>> client_opt;
 
     if (FLAGS_client_type == "P2P") {
+        // Build tiered_backend_config from ram_buffer_size_gb so the P2P
+        // storage capacity is consistent with the Centralization segment size.
+        // FLAGS_tiered_backend_config can still override this if explicitly set.
+        std::string tiered_config = FLAGS_tiered_backend_config;
+        if (tiered_config.find("16106127360") != std::string::npos) {
+            // Default value is still 15GB placeholder — replace with actual flag
+            uint64_t capacity_bytes =
+                FLAGS_ram_buffer_size_gb * 1024ull * 1024 * 1024;
+            tiered_config =
+                "{\"tiers\": [{\"type\": \"DRAM\", \"capacity\": " +
+                std::to_string(capacity_bytes) +
+                ", \"priority\": 10, \"allocator_type\": \"OFFSET\"}]}";
+        }
         auto config = ClientConfigBuilder::build_p2p_real_client(
             FLAGS_local_hostname, FLAGS_metadata_connection_string,
             FLAGS_protocol, device_names, FLAGS_master_address,
-            FLAGS_tiered_backend_config, 0, nullptr, "", 12345,
+            tiered_config, 0, nullptr, "", 12345,
             /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
             /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
             /*route_cache_ttl_ms=*/5 * 60 * 1000,
