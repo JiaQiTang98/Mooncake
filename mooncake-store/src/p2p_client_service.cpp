@@ -6,9 +6,25 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <numeric>
 #include <thread>
+#include <type_traits>
 
 namespace mooncake {
+namespace {
+
+const char* ToString(P2PClientConfig::LocalTransferMode mode) {
+    switch (mode) {
+        case P2PClientConfig::LocalTransferMode::MEMCPY:
+            return "memcpy";
+        case P2PClientConfig::LocalTransferMode::TE:
+            return "te";
+        default:
+            return "unknown";
+    }
+}
+
+}  // namespace
 
 P2PClientService::AsyncMemcpyExecutor::AsyncMemcpyExecutor(
     size_t worker_num, size_t max_queue_size)
@@ -21,86 +37,66 @@ P2PClientService::AsyncMemcpyExecutor::AsyncMemcpyExecutor(
 
 P2PClientService::AsyncMemcpyExecutor::~AsyncMemcpyExecutor() { Shutdown(); }
 
-std::vector<ErrorCode>
-P2PClientService::AsyncMemcpyExecutor::BatchHandle::Wait() const {
-    if (!state) {
-        return {};
+template <typename ResultType, typename TaskFn, typename ErrorFn>
+P2PClientService::AsyncMemcpyExecutor::BatchHandle<ResultType>
+P2PClientService::AsyncMemcpyExecutor::SubmitBatchTasks(
+    const std::vector<size_t>& indices, TaskFn&& task_fn, ErrorFn&& on_error) {
+    auto batch_state = std::make_shared<BatchState<ResultType>>();
+    batch_state->results.reserve(indices.size());
+
+    using TaskFnType = typename std::decay<TaskFn>::type;
+    using ErrorFnType = typename std::decay<ErrorFn>::type;
+    auto task_fn_ptr =
+        std::make_shared<TaskFnType>(std::forward<TaskFn>(task_fn));
+    auto on_error_ptr =
+        std::make_shared<ErrorFnType>(std::forward<ErrorFn>(on_error));
+
+    for (size_t index : indices) {
+        batch_state->results.push_back((*on_error_ptr)(index));
     }
-
-    if (state->remaining.load(std::memory_order_acquire) > 0) {
-        std::unique_lock<std::mutex> lock(state->done_mutex);
-        state->done_cv.wait(lock, [this] { return state->done; });
-    }
-    return state->results;
-}
-
-void P2PClientService::AsyncMemcpyExecutor::FinishBatchTask(
-    const std::shared_ptr<BatchState>& state, size_t batch_index,
-    ErrorCode result) {
-    if (!state) {
-        return;
-    }
-    state->results[batch_index] = result;
-    if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        std::lock_guard<std::mutex> lock(state->done_mutex);
-        state->done = true;
-        state->done_cv.notify_one();
-    }
-}
-
-std::future<ErrorCode> P2PClientService::AsyncMemcpyExecutor::Submit(
-    LocalCopyPlan plan) {
-    std::promise<ErrorCode> result;
-    auto future = result.get_future();
-
-    // Step 1: backpressure on bounded queue.
-    std::unique_lock<std::mutex> lock(mutex_);
-    queue_not_full_cv_.wait(
-        lock, [this] { return shutting_down_ || tasks_.size() < max_queue_size_; });
-    if (shutting_down_) {
-        result.set_value(ErrorCode::SHUTTING_DOWN);
-        return future;
-    }
-
-    // Step 2: enqueue task and wake one worker.
-    CopyTask task;
-    task.plan = std::move(plan);
-    task.result = std::move(result);
-    task.is_batch = false;
-    tasks_.push(std::move(task));
-    lock.unlock();
-    queue_not_empty_cv_.notify_one();
-    return future;
-}
-
-P2PClientService::AsyncMemcpyExecutor::BatchHandle
-P2PClientService::AsyncMemcpyExecutor::SubmitBatch(
-    std::vector<LocalCopyPlan> plans) {
-    auto batch_state = std::make_shared<BatchState>();
-    batch_state->results.resize(plans.size(), ErrorCode::INTERNAL_ERROR);
-    batch_state->remaining.store(plans.size(), std::memory_order_relaxed);
-    if (plans.empty()) {
+    batch_state->remaining.store(indices.size(), std::memory_order_relaxed);
+    if (indices.empty()) {
         batch_state->done = true;
-        return BatchHandle{batch_state};
+        return BatchHandle<ResultType>{batch_state};
     }
 
     size_t enqueued = 0;
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        for (; enqueued < plans.size(); ++enqueued) {
-            // Backpressure: wait if the queue is full.
+        for (; enqueued < indices.size(); ++enqueued) {
+            // Backpressure: keep bounded queue semantics for all async paths.
             queue_not_full_cv_.wait(lock, [this] {
                 return shutting_down_ || tasks_.size() < max_queue_size_;
             });
             if (shutting_down_) {
                 break;
             }
-            CopyTask task;
-            task.plan = std::move(plans[enqueued]);
-            task.batch_state = batch_state;
-            task.batch_index = enqueued;
-            task.is_batch = true;
-            tasks_.push(std::move(task));
+
+            const size_t slot = enqueued;
+            const size_t index = indices[slot];
+            QueueTask queue_task;
+            queue_task.run = [batch_state, task_fn_ptr, on_error_ptr, slot,
+                              index]() mutable {
+                ResultType result = (*on_error_ptr)(index);
+                try {
+                    result = (*task_fn_ptr)(index);
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "Async batch task execution threw exception "
+                                  "at index "
+                               << index << ": " << e.what();
+                    result = (*on_error_ptr)(index);
+                } catch (...) {
+                    LOG(ERROR) << "Async batch task execution threw unknown "
+                                  "exception at index "
+                               << index;
+                    result = (*on_error_ptr)(index);
+                }
+                FinishBatchTask(batch_state, slot, std::move(result));
+            };
+            queue_task.cancel = [batch_state, on_error_ptr, slot, index]() {
+                FinishBatchTask(batch_state, slot, (*on_error_ptr)(index));
+            };
+            tasks_.push(std::move(queue_task));
         }
     }
 
@@ -111,10 +107,11 @@ P2PClientService::AsyncMemcpyExecutor::SubmitBatch(
 
     // If shutdown happened during submission, mark unsubmitted tasks so the
     // caller's batch wait can still finish.
-    for (size_t i = enqueued; i < plans.size(); ++i) {
-        FinishBatchTask(batch_state, i, ErrorCode::SHUTTING_DOWN);
+    for (size_t slot = enqueued; slot < indices.size(); ++slot) {
+        const size_t index = indices[slot];
+        FinishBatchTask(batch_state, slot, (*on_error_ptr)(index));
     }
-    return BatchHandle{batch_state};
+    return BatchHandle<ResultType>{batch_state};
 }
 
 void P2PClientService::AsyncMemcpyExecutor::Shutdown() {
@@ -135,18 +132,15 @@ void P2PClientService::AsyncMemcpyExecutor::Shutdown() {
     }
     workers_.clear();
 
-    std::queue<CopyTask> pending;
+    std::queue<QueueTask> pending;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pending.swap(tasks_);
     }
     while (!pending.empty()) {
-        auto& task = pending.front();
-        if (task.is_batch && task.batch_state) {
-            FinishBatchTask(task.batch_state, task.batch_index,
-                            ErrorCode::SHUTTING_DOWN);
-        } else {
-            task.result.set_value(ErrorCode::SHUTTING_DOWN);
+        auto task = std::move(pending.front());
+        if (task.cancel) {
+            task.cancel();
         }
         pending.pop();
     }
@@ -154,7 +148,7 @@ void P2PClientService::AsyncMemcpyExecutor::Shutdown() {
 
 void P2PClientService::AsyncMemcpyExecutor::WorkerMain() {
     while (true) {
-        CopyTask task;
+        QueueTask task;
         {
             // Step 1: wait until there is work or shutdown.
             std::unique_lock<std::mutex> lock(mutex_);
@@ -170,14 +164,21 @@ void P2PClientService::AsyncMemcpyExecutor::WorkerMain() {
             queue_not_full_cv_.notify_one();
         }
 
-        // Step 3: execute memcpy and publish result to either single-future or
-        // batch completion state.
-        const ErrorCode copy_result =
-            P2PClientService::ExecuteLocalCopyPlan(task.plan);
-        if (task.is_batch && task.batch_state) {
-            FinishBatchTask(task.batch_state, task.batch_index, copy_result);
-        } else {
-            task.result.set_value(copy_result);
+        // Step 3: execute one queued task.
+        try {
+            if (task.run) {
+                task.run();
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Async worker task threw exception: " << e.what();
+            if (task.cancel) {
+                task.cancel();
+            }
+        } catch (...) {
+            LOG(ERROR) << "Async worker task threw unknown exception";
+            if (task.cancel) {
+                task.cancel();
+            }
         }
     }
 }
@@ -214,8 +215,11 @@ void P2PClientService::Stop() {
         data_manager_->Stop();
     }
 
-    if (async_memcpy_executor_) {
-        async_memcpy_executor_->Shutdown();
+    if (async_local_copy_executor_) {
+        async_local_copy_executor_->Shutdown();
+    }
+    if (async_remote_batch_executor_) {
+        async_remote_batch_executor_->Shutdown();
     }
 
     // Stop heartbeat
@@ -237,7 +241,8 @@ void P2PClientService::Destroy() {
         data_manager_->Destroy();
     }
     data_manager_.reset();
-    async_memcpy_executor_.reset();
+    async_local_copy_executor_.reset();
+    async_remote_batch_executor_.reset();
 
     ClientService::Destroy();
 
@@ -363,19 +368,37 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
     local_copy_async_worker_num_ = config.local_copy_async_worker_num;
     local_copy_async_queue_depth_ =
         std::max<size_t>(1, config.local_copy_async_queue_depth);
+    remote_batch_async_key_threshold_ =
+        std::max<size_t>(1, config.remote_batch_async_key_threshold);
+    remote_batch_async_worker_num_ = config.remote_batch_async_worker_num;
+    local_transfer_mode_ = config.local_transfer_mode;
 
-    // Step 2: construct (or disable) async executor based on worker count.
+    // Step 2: construct local/remote async executors independently.
+    // They share the same submit/wait framework but remain separate pools
+    // to prevent remote RPC latency from stalling local memcpy tasks.
     if (local_copy_async_worker_num_ > 0) {
-        async_memcpy_executor_ = std::make_unique<AsyncMemcpyExecutor>(
+        async_local_copy_executor_ = std::make_unique<AsyncMemcpyExecutor>(
             local_copy_async_worker_num_, local_copy_async_queue_depth_);
-        LOG(INFO) << "P2P local async memcpy enabled, workers="
-                  << local_copy_async_worker_num_
-                  << ", queue_depth=" << local_copy_async_queue_depth_
-                  << ", key_threshold=" << local_copy_async_key_threshold_;
     } else {
-        async_memcpy_executor_.reset();
-        LOG(INFO) << "P2P local async memcpy disabled because workers=0";
+        async_local_copy_executor_.reset();
     }
+
+    if (remote_batch_async_worker_num_ > 0) {
+        async_remote_batch_executor_ = std::make_unique<AsyncMemcpyExecutor>(
+            remote_batch_async_worker_num_, local_copy_async_queue_depth_);
+    } else {
+        async_remote_batch_executor_.reset();
+    }
+
+    LOG(INFO) << "P2P async executors initialized"
+              << ", local_async_workers=" << local_copy_async_worker_num_
+              << ", local_async_queue_depth=" << local_copy_async_queue_depth_
+              << ", local_async_key_threshold=" << local_copy_async_key_threshold_
+              << ", remote_async_workers=" << remote_batch_async_worker_num_
+              << ", remote_async_queue_depth=" << local_copy_async_queue_depth_
+              << ", remote_async_key_threshold="
+              << remote_batch_async_key_threshold_
+              << ", local_transfer_mode=" << ToString(local_transfer_mode_);
 
     return ErrorCode::OK;
 }
@@ -565,8 +588,32 @@ tl::expected<void, ErrorCode> P2PClientService::PutLocal(
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    // TE-mode local put intentionally reuses the same data path as remote
+    // writes (WriteRemoteData + TE pull). This keeps semantics consistent:
+    // source buffers must be TE-registered and multi-slice writes are allowed.
+    if (UseLocalTeTransfer()) {
+        std::vector<RemoteBufferDesc> src_buffers;
+        src_buffers.reserve(slices.size());
+        for (const auto& slice : slices) {
+            RemoteBufferDesc buf;
+            buf.segment_endpoint = get_te_endpoint();
+            buf.addr = reinterpret_cast<uintptr_t>(slice.ptr);
+            buf.size = slice.size;
+            src_buffers.push_back(std::move(buf));
+        }
+
+        auto result = data_manager_->WriteRemoteData(key, src_buffers);
+        if (!result && result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
+            result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
+            VLOG(1) << "Local TE put failed for key: " << key
+                    << " error: " << result.error();
+            return tl::unexpected(result.error());
+        }
+        return {};
+    }
+
     if (slices.size() != 1) {
-        LOG(ERROR) << "PutLocal currently only supports a single slice, "
+        LOG(ERROR) << "PutLocal in memcpy mode only supports a single slice, "
                       "but received slice size = "
                    << slices.size();
         return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
@@ -575,7 +622,7 @@ tl::expected<void, ErrorCode> P2PClientService::PutLocal(
     auto result = data_manager_->Put(key, slices[0]);
     if (!result && result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
         result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
-        VLOG(1) << "Local put failed for key: " << key
+        VLOG(1) << "Local memcpy put failed for key: " << key
                 << " error: " << result.error();
         return tl::unexpected(result.error());
     }
@@ -650,7 +697,10 @@ tl::expected<void, ErrorCode> P2PClientService::PutViaRoute(
                 write_req.src_buffers.push_back(buf);
             }
 
-            auto write_result = peer.WriteRemoteData(write_req);
+            // Remote RPC is issued through async interface so batch callers
+            // can fan out multiple keys concurrently.
+            auto write_result = async_simple::coro::syncAwait(
+                peer.AsyncWriteRemoteData(write_req));
             if (!write_result) {
                 if (write_result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
                     write_result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
@@ -723,10 +773,69 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::SHUTTING_DOWN));
     }
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results.push_back(Put(keys[i], batched_slices[i], config));
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    if (keys.size() != batched_slices.size()) {
+        LOG(ERROR) << "BatchPut input size mismatch, keys=" << keys.size()
+                   << ", batched_slices=" << batched_slices.size();
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    // Compatibility mode: keep the old synchronous BatchPut behavior unless
+    // remote batch async is explicitly enabled.
+    if (!ShouldUseAsyncBatchRpc(keys.size())) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = Put(keys[i], batched_slices[i], config);
+        }
+        return results;
+    }
+
+    const auto* route_config = std::get_if<WriteRouteRequestConfig>(&config);
+    if (!route_config) {
+        LOG(ERROR) << "P2PClientService currently only supports "
+                      "WriteRouteRequestConfig";
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    std::vector<size_t> all_indices(keys.size());
+    std::iota(all_indices.begin(), all_indices.end(), 0);
+
+    // Stage-1 (Submit): enqueue all remote put tasks as one batch handle.
+    // Stage-2 (Wait): collect every result once and map back to key order.
+    auto remote_batch =
+        async_remote_batch_executor_
+            ->SubmitBatchTasks<tl::expected<void, ErrorCode>>(
+                all_indices,
+                [this, &keys, &batched_slices, route_config](
+                    size_t index) -> tl::expected<void, ErrorCode> {
+                    auto put_result = PutViaRoute(
+                        keys[index], batched_slices[index], *route_config);
+                    if (!put_result &&
+                        put_result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
+                        put_result.error() !=
+                            ErrorCode::REPLICA_ALREADY_EXISTS) {
+                        LOG(ERROR) << "Failed to put key in BatchPut, key="
+                                   << keys[index]
+                                   << ", error=" << put_result.error();
+                        return tl::unexpected(put_result.error());
+                    }
+                    return {};
+                },
+                [](size_t /*index*/) -> tl::expected<void, ErrorCode> {
+                    return tl::unexpected(ErrorCode::SHUTTING_DOWN);
+                });
+    auto remote_results = remote_batch.Wait();
+    for (size_t slot = 0; slot < all_indices.size(); ++slot) {
+        if (slot < remote_results.size()) {
+            results[all_indices[slot]] = std::move(remote_results[slot]);
+        } else {
+            results[all_indices[slot]] =
+                tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
     }
     return results;
 }
@@ -802,6 +911,73 @@ P2PClientService::BuildLocalCopyPlan(const std::string& key,
     return plan;
 }
 
+tl::expected<size_t, ErrorCode> P2PClientService::CopyLocalBufferSync(
+    const std::string& key, const AllocationHandle& handle,
+    const std::vector<Slice>& slices) {
+    if (!handle) {
+        LOG(ERROR) << "Invalid local allocation handle for key: " << key;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    const auto& loc = handle->loc;
+    if (!loc.data.buffer) {
+        LOG(ERROR) << "Allocation handle has null buffer for key: " << key;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    const char* source = reinterpret_cast<const char*>(loc.data.buffer->data());
+    const size_t source_size = loc.data.buffer->size();
+    const size_t provided_size = ClientService::CalculateSliceSize(slices);
+    if (provided_size < source_size) {
+        LOG(ERROR) << "Buffer too small for local key '" << key
+                   << "': required=" << source_size
+                   << ", provided=" << provided_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Fast path for the common single-destination case.
+    if (slices.size() == 1) {
+        const auto& slice = slices[0];
+        if (!slice.ptr && source_size > 0) {
+            LOG(ERROR) << "Local copy destination buffer is null";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (slice.size < source_size) {
+            LOG(ERROR) << "Local copy destination is too small, required="
+                       << source_size << ", provided=" << slice.size;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (source_size > 0) {
+            std::memcpy(slice.ptr, source, source_size);
+        }
+        return source_size;
+    }
+
+    size_t offset = 0;
+    for (const auto& slice : slices) {
+        if (offset >= source_size) {
+            break;
+        }
+        const size_t copy_size = std::min(slice.size, source_size - offset);
+        if (copy_size == 0) {
+            continue;
+        }
+        if (!slice.ptr) {
+            LOG(ERROR) << "Local copy destination buffer is null";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::memcpy(slice.ptr, source + offset, copy_size);
+        offset += copy_size;
+    }
+
+    if (offset != source_size) {
+        LOG(ERROR) << "Local copy did not complete, copied=" << offset
+                   << ", source_size=" << source_size;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return source_size;
+}
+
 ErrorCode P2PClientService::ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
     if (plan.use_single_dest) {
         if (!plan.single_dest_ptr) {
@@ -848,45 +1024,18 @@ ErrorCode P2PClientService::ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
     return ErrorCode::OK;
 }
 
-tl::expected<size_t, ErrorCode> P2PClientService::RunLocalCopy(
-    const std::string& key, const AllocationHandle& handle,
-    const std::vector<Slice>& slices, size_t batch_key_count) {
-    // Step 1: validate source/destination and materialize a copy plan.
-    auto plan_result = BuildLocalCopyPlan(key, handle, slices);
-    if (!plan_result) {
-        return tl::unexpected(plan_result.error());
-    }
-
-    auto plan = std::move(plan_result.value());
-    const size_t source_size = plan.source_size;
-
-    // Step 2: when batch key count crosses threshold, use async queue.
-    if (ShouldUseAsyncLocalCopy(batch_key_count)) {
-        auto copy_future = async_memcpy_executor_->Submit(std::move(plan));
-        ErrorCode copy_result = ErrorCode::INTERNAL_ERROR;
-        try {
-            copy_result = copy_future.get();
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Async local copy failed with exception: " << e.what();
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        if (copy_result != ErrorCode::OK) {
-            return tl::unexpected(copy_result);
-        }
-        return source_size;
-    }
-
-    // Step 3: synchronous memcpy fallback path.
-    const ErrorCode copy_result = ExecuteLocalCopyPlan(plan);
-    if (copy_result != ErrorCode::OK) {
-        return tl::unexpected(copy_result);
-    }
-    return source_size;
+bool P2PClientService::ShouldUseAsyncLocalCopy(size_t batch_key_count) const {
+    return async_local_copy_executor_ != nullptr &&
+           batch_key_count >= local_copy_async_key_threshold_;
 }
 
-bool P2PClientService::ShouldUseAsyncLocalCopy(size_t batch_key_count) const {
-    return async_memcpy_executor_ != nullptr &&
-           batch_key_count >= local_copy_async_key_threshold_;
+bool P2PClientService::ShouldUseAsyncBatchRpc(size_t batch_key_count) const {
+    return async_remote_batch_executor_ != nullptr &&
+           batch_key_count >= remote_batch_async_key_threshold_;
+}
+
+bool P2PClientService::UseLocalTeTransfer() const {
+    return local_transfer_mode_ == P2PClientConfig::LocalTransferMode::TE;
 }
 
 std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
@@ -922,9 +1071,12 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
     };
     std::vector<StagedCopy> staged;
     staged.reserve(keys.size());
-    std::optional<AsyncMemcpyExecutor::BatchHandle> async_batch;
+    std::optional<AsyncMemcpyExecutor::BatchHandle<ErrorCode>> async_batch;
     // Batch-level constant: avoid evaluating the same condition per key.
-    const bool use_async_local_copy = ShouldUseAsyncLocalCopy(keys.size());
+    // In TE mode we bypass async memcpy executor entirely, because local
+    // transfers already go through TransferEngine instead of CPU memcpy plans.
+    const bool use_async_local_copy =
+        !UseLocalTeTransfer() && ShouldUseAsyncLocalCopy(keys.size());
 
     // Step 1: detect local hits; stage async plans or execute synchronously.
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -952,6 +1104,19 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
             std::make_shared<BufferHandle>(std::move(*alloc_result));
         std::vector<Slice> local_slices = {
             Slice{output_handle->ptr(), local_size}};
+
+        // TE local mode: execute transfer directly and record result inline.
+        // Memcpy mode continues to build staged plans below.
+        if (UseLocalTeTransfer()) {
+            auto local_result = GetLocal(keys[i], local_slices);
+            if (!local_result) {
+                results[i] = tl::unexpected(local_result.error());
+                continue;
+            }
+            results[i] = std::move(output_handle);
+            continue;
+        }
+
         auto plan_result =
             BuildLocalCopyPlan(keys[i], local_handle.value(), local_slices);
         if (!plan_result) {
@@ -979,12 +1144,54 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
         std::vector<LocalCopyPlan> plans;
         plans.reserve(staged.size());
         for (auto& s : staged) plans.push_back(std::move(s.plan));
-        async_batch.emplace(async_memcpy_executor_->SubmitBatch(std::move(plans)));
+        std::vector<size_t> plan_indices(plans.size());
+        std::iota(plan_indices.begin(), plan_indices.end(), 0);
+        auto plans_ptr =
+            std::make_shared<std::vector<LocalCopyPlan>>(std::move(plans));
+        async_batch.emplace(
+            async_local_copy_executor_->SubmitBatchTasks<ErrorCode>(
+                plan_indices,
+                [plans_ptr](size_t index) -> ErrorCode {
+                    if (index >= plans_ptr->size()) {
+                        return ErrorCode::INTERNAL_ERROR;
+                    }
+                    return P2PClientService::ExecuteLocalCopyPlan(
+                        (*plans_ptr)[index]);
+                },
+                [](size_t /*index*/) -> ErrorCode {
+                    return ErrorCode::SHUTTING_DOWN;
+                }));
     }
 
-    // Step 2: process local misses via existing per-key Get flow.
-    for (size_t idx : fallback_indices) {
-        results[idx] = Get(keys[idx], allocator, config);
+    // Step 2: process local misses via per-key Get flow.
+    // Keep the old synchronous behavior by default; only fan out when
+    // remote batch async is explicitly enabled.
+    if (!ShouldUseAsyncBatchRpc(fallback_indices.size())) {
+        for (size_t idx : fallback_indices) {
+            results[idx] = Get(keys[idx], allocator, config);
+        }
+    } else {
+        auto remote_batch =
+            async_remote_batch_executor_->SubmitBatchTasks<
+                tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>(
+                fallback_indices,
+                [&](size_t index)
+                    -> tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> {
+                    return Get(keys[index], allocator, config);
+                },
+                [](size_t /*index*/)
+                    -> tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> {
+                    return tl::unexpected(ErrorCode::SHUTTING_DOWN);
+                });
+        auto remote_results = remote_batch.Wait();
+        for (size_t slot = 0; slot < fallback_indices.size(); ++slot) {
+            const size_t index = fallback_indices[slot];
+            if (slot < remote_results.size()) {
+                results[index] = std::move(remote_results[slot]);
+            } else {
+                results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
     }
 
     // Step 3: wait for staged async local copies and finalize results.
@@ -1038,8 +1245,17 @@ tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
                 auto buffer_handle = std::move(*alloc_result);
                 std::vector<Slice> local_slices = {
                     Slice{buffer_handle.ptr(), local_size}};
-                auto local_copy_result =
-                    RunLocalCopy(key, handle.value(), local_slices);
+                tl::expected<size_t, ErrorCode> local_copy_result =
+                    tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                // Keep single-key allocator Get consistent with other local
+                // paths: TE mode uses TransferEngine read, memcpy mode uses
+                // the unified local-copy helper.
+                if (UseLocalTeTransfer()) {
+                    local_copy_result = GetLocal(key, local_slices);
+                } else {
+                    local_copy_result =
+                        CopyLocalBufferSync(key, handle.value(), local_slices);
+                }
                 if (!local_copy_result) {
                     LOG(ERROR) << "Failed local copy for key: " << key
                                << ", error: " << local_copy_result.error();
@@ -1149,8 +1365,11 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
     };
     std::vector<StagedCopy> staged;
     staged.reserve(keys.size());
-    std::optional<AsyncMemcpyExecutor::BatchHandle> async_batch;
-    const bool use_async_local_copy = ShouldUseAsyncLocalCopy(keys.size());
+    std::optional<AsyncMemcpyExecutor::BatchHandle<ErrorCode>> async_batch;
+    // Same rule as allocator-based BatchGet: disable async memcpy staging
+    // when local TE transfer mode is enabled.
+    const bool use_async_local_copy =
+        !UseLocalTeTransfer() && ShouldUseAsyncLocalCopy(keys.size());
 
     // Step 1: attempt local copy for each key; stage async plans or execute
     // synchronously.
@@ -1169,6 +1388,18 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
         auto local_handle = data_manager_->Get(keys[i]);
         if (!local_handle || !local_handle.value()->loc.data.buffer) {
             fallback_indices.push_back(i);
+            continue;
+        }
+
+        // TE local mode executes immediately via GetLocal; memcpy mode
+        // stays on the staged/sync memcpy path.
+        if (UseLocalTeTransfer()) {
+            auto local_result = GetLocal(keys[i], local_slices);
+            if (local_result) {
+                results[i] = static_cast<int64_t>(local_result.value());
+            } else {
+                results[i] = tl::unexpected(local_result.error());
+            }
             continue;
         }
 
@@ -1199,17 +1430,61 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
         std::vector<LocalCopyPlan> plans;
         plans.reserve(staged.size());
         for (auto& s : staged) plans.push_back(std::move(s.plan));
-        async_batch.emplace(async_memcpy_executor_->SubmitBatch(std::move(plans)));
+        std::vector<size_t> plan_indices(plans.size());
+        std::iota(plan_indices.begin(), plan_indices.end(), 0);
+        auto plans_ptr =
+            std::make_shared<std::vector<LocalCopyPlan>>(std::move(plans));
+        async_batch.emplace(
+            async_local_copy_executor_->SubmitBatchTasks<ErrorCode>(
+                plan_indices,
+                [plans_ptr](size_t index) -> ErrorCode {
+                    if (index >= plans_ptr->size()) {
+                        return ErrorCode::INTERNAL_ERROR;
+                    }
+                    return P2PClientService::ExecuteLocalCopyPlan(
+                        (*plans_ptr)[index]);
+                },
+                [](size_t /*index*/) -> ErrorCode {
+                    return ErrorCode::SHUTTING_DOWN;
+                }));
     }
 
     // Step 2: fallback keys use the original Get path (local+remote logic).
-    for (size_t idx : fallback_indices) {
-        results[idx] = Get(keys[idx], all_buffers[idx], all_sizes[idx], config);
+    // Keep old synchronous behavior by default; only fan out when explicitly
+    // enabled by remote async config.
+    if (!ShouldUseAsyncBatchRpc(fallback_indices.size())) {
+        for (size_t idx : fallback_indices) {
+            results[idx] = Get(keys[idx], all_buffers[idx], all_sizes[idx],
+                               config);
+        }
+    } else {
+        auto remote_batch =
+            async_remote_batch_executor_
+                ->SubmitBatchTasks<tl::expected<int64_t, ErrorCode>>(
+                    fallback_indices,
+                    [&](size_t index) -> tl::expected<int64_t, ErrorCode> {
+                        return Get(keys[index], all_buffers[index],
+                                   all_sizes[index], config);
+                    },
+                    [](size_t /*index*/) -> tl::expected<int64_t, ErrorCode> {
+                        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
+                    });
+        auto remote_results = remote_batch.Wait();
+        for (size_t slot = 0; slot < fallback_indices.size(); ++slot) {
+            const size_t index = fallback_indices[slot];
+            if (slot < remote_results.size()) {
+                results[index] = std::move(remote_results[slot]);
+            } else {
+                results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
     }
 
     // Step 3: collect async local-copy completions.
     if (async_batch.has_value()) {
         auto copy_results = async_batch->Wait();
+        std::vector<size_t> copy_failed_indices;
+        copy_failed_indices.reserve(staged.size());
         for (size_t j = 0; j < staged.size(); ++j) {
             const ErrorCode copy_result =
                 j < copy_results.size() ? copy_results[j]
@@ -1218,10 +1493,38 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
                 results[staged[j].index] =
                     static_cast<int64_t>(staged[j].source_size);
             } else {
-                results[staged[j].index] = Get(keys[staged[j].index],
-                                               all_buffers[staged[j].index],
-                                               all_sizes[staged[j].index],
-                                               config);
+                copy_failed_indices.push_back(staged[j].index);
+            }
+        }
+
+        // Failed staged local copies fall back to the original Get path.
+        // This keeps default behavior unchanged unless remote async is turned
+        // on explicitly.
+        if (!ShouldUseAsyncBatchRpc(copy_failed_indices.size())) {
+            for (size_t idx : copy_failed_indices) {
+                results[idx] =
+                    Get(keys[idx], all_buffers[idx], all_sizes[idx], config);
+            }
+        } else {
+            auto retry_batch =
+                async_remote_batch_executor_
+                    ->SubmitBatchTasks<tl::expected<int64_t, ErrorCode>>(
+                        copy_failed_indices,
+                        [&](size_t index) -> tl::expected<int64_t, ErrorCode> {
+                            return Get(keys[index], all_buffers[index],
+                                       all_sizes[index], config);
+                        },
+                        [](size_t /*index*/) -> tl::expected<int64_t, ErrorCode> {
+                            return tl::unexpected(ErrorCode::SHUTTING_DOWN);
+                        });
+            auto retry_results = retry_batch.Wait();
+            for (size_t slot = 0; slot < copy_failed_indices.size(); ++slot) {
+                const size_t index = copy_failed_indices[slot];
+                if (slot < retry_results.size()) {
+                    results[index] = std::move(retry_results[slot]);
+                } else {
+                    results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
             }
         }
     }
@@ -1249,12 +1552,14 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
         for (size_t i = 0; i < buffers.size(); ++i) {
             local_slices.emplace_back(Slice{buffers[i], sizes[i]});
         }
+
         auto local_result = GetLocal(key, local_slices);
         if (local_result) {
             return static_cast<int64_t>(local_result.value());
         }
-        // GetLocal returns OBJECT_NOT_FOUND on miss — continue to remote;
-        // other errors are also non-fatal here, fall through to remote path.
+        // Keep backward-compatible local-first semantics for both memcpy and
+        // TE modes: local miss or local transfer failure falls through to the
+        // route-based remote path.
     }
 
     // Step 1.5: Try RouteCache before querying Master
@@ -1333,7 +1638,34 @@ tl::expected<size_t, ErrorCode> P2PClientService::GetLocal(
         return tl::unexpected(handle.error());
     }
 
-    return RunLocalCopy(key, handle.value(), slices);
+    // TE local read path: treat local memory as a TE source endpoint so the
+    // same transfer pipeline is used for both local and remote reads.
+    if (UseLocalTeTransfer()) {
+        if (!handle.value()->loc.data.buffer) {
+            LOG(ERROR) << "Local TE get handle has no data buffer, key: "
+                       << key;
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        const size_t source_size = handle.value()->loc.data.buffer->size();
+
+        std::vector<RemoteBufferDesc> dest_buffers;
+        dest_buffers.reserve(slices.size());
+        for (const auto& slice : slices) {
+            RemoteBufferDesc buffer;
+            buffer.segment_endpoint = get_te_endpoint();
+            buffer.addr = reinterpret_cast<uintptr_t>(slice.ptr);
+            buffer.size = slice.size;
+            dest_buffers.push_back(std::move(buffer));
+        }
+
+        auto te_result = data_manager_->ReadRemoteData(key, dest_buffers);
+        if (!te_result) {
+            return tl::unexpected(te_result.error());
+        }
+        return source_size;
+    }
+
+    return CopyLocalBufferSync(key, handle.value(), slices);
 }
 
 tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
@@ -1389,7 +1721,10 @@ tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
                 read_req.dest_buffers.push_back(buf);
             }
 
-            auto read_result = peer.ReadRemoteData(read_req);
+            // Keep single-key semantics unchanged, but use async RPC API so
+            // BatchGet can parallelize multiple remote reads cleanly.
+            auto read_result = async_simple::coro::syncAwait(
+                peer.AsyncReadRemoteData(read_req));
             if (!read_result) {
                 LOG(WARNING) << "Remote read from " << endpoint
                              << " failed for key: " << key

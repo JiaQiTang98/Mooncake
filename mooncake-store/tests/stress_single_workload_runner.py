@@ -40,6 +40,8 @@ P2P-Specific (ignored in Centralization mode):
 --async_threshold:   Min key count to trigger async copy, supports lists like "2,8,256" (default: 2)
 --async_workers:     Number of async copy worker threads, supports lists like "1,4,8" (default: 4)
 --async_queue_depth: Async copy task queue depth, supports lists like "256,1024" (default: 1024)
+--remote_async_threshold: Min key count to trigger async remote batch fan-out (default: 2)
+--remote_async_workers:   Number of async remote batch workers, 0 keeps sync behavior (default: 0)
 """
 
 import subprocess
@@ -118,8 +120,9 @@ def parse_metrics(output):
             
     return metrics
 
-def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb, 
-                         batch=1, async_threshold=2, async_workers=1, async_queue_depth=1024):
+def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
+                         batch=1, async_threshold=2, async_workers=1, async_queue_depth=1024,
+                         remote_async_threshold=2, remote_async_workers=0):
     """Run a specific configuration for a single mode."""
     kill_existing_processes()
     
@@ -133,7 +136,13 @@ def run_benchmark_config(mode, rounds, threads, value_size, ops, rpc_threads, ra
                     f"--test_operation_nums={ops} --ram_buffer_size_gb={ram_buffer_size_gb} --batch_size={batch}")
         
         if mode == "P2P":
-            test_cmd += f" --async_copy_threshold={async_threshold} --async_copy_worker_num={async_workers} --async_copy_queue_depth={async_queue_depth}"
+            test_cmd += (
+                f" --async_copy_threshold={async_threshold}"
+                f" --async_copy_worker_num={async_workers}"
+                f" --async_copy_queue_depth={async_queue_depth}"
+                f" --remote_async_threshold={remote_async_threshold}"
+                f" --remote_async_worker_num={remote_async_workers}"
+            )
             
         output = run_command(test_cmd)
         metrics = parse_metrics(output)
@@ -181,6 +190,10 @@ def main():
     parser.add_argument("--async_threshold", type=str, default="2", help="Async copy threshold (P2P only, list: 2,8,256)")
     parser.add_argument("--async_workers", type=str, default="4", help="Async copy workers (P2P only, list: 1,4,8)")
     parser.add_argument("--async_queue_depth", type=str, default="1024", help="Async copy queue depth (P2P only, list: 256,1024)")
+    parser.add_argument("--remote_async_threshold", type=str, default="2",
+                        help="Async remote batch threshold (P2P only, list: 2,8,256)")
+    parser.add_argument("--remote_async_workers", type=str, default="0",
+                        help="Async remote batch workers (P2P only, list: 0,2,4)")
     
     # Flags
     parser.add_argument("--matrix", action="store_true", help="Enable matrix sweep mode")
@@ -211,6 +224,8 @@ def main():
         "async_threshold": parse_list_arg(args.async_threshold),
         "async_workers": parse_list_arg(args.async_workers),
         "async_queue_depth": parse_list_arg(args.async_queue_depth),
+        "remote_async_threshold": parse_list_arg(args.remote_async_threshold),
+        "remote_async_workers": parse_list_arg(args.remote_async_workers),
     }
 
     results = []
@@ -261,15 +276,26 @@ def main():
             for p2p_combo in active_p2p_combinations:
                 current += 1
                 p2p_cfg = dict(zip(p2p_keys, p2p_combo))
-                a_th, a_wk, a_qd = [p2p_cfg[k] for k in p2p_keys]
+                a_th = p2p_cfg["async_threshold"]
+                a_wk = p2p_cfg["async_workers"]
+                a_qd = p2p_cfg["async_queue_depth"]
+                ra_th = p2p_cfg["remote_async_threshold"]
+                ra_wk = p2p_cfg["remote_async_workers"]
 
                 print(f"\n[{current}/{total_runs}] Testing: mode=P2P")
                 print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
                 if batch > 1:
-                    print(f"    async_threshold={a_th}, async_workers={a_wk}, async_queue_depth={a_qd}")
+                    print(
+                        f"    async_threshold={a_th}, async_workers={a_wk}, "
+                        f"async_queue_depth={a_qd}, remote_async_threshold={ra_th}, "
+                        f"remote_async_workers={ra_wk}"
+                    )
 
                 avg = run_benchmark_config("P2P", args.rounds, th, v_size, ops, r_th, r_buf_gb,
-                                           batch=batch, async_threshold=a_th, async_workers=a_wk, async_queue_depth=a_qd)
+                                           batch=batch, async_threshold=a_th,
+                                           async_workers=a_wk, async_queue_depth=a_qd,
+                                           remote_async_threshold=ra_th,
+                                           remote_async_workers=ra_wk)
                 if avg:
                     entry = {"mode": "P2P", **base_cfg, **(p2p_cfg if batch > 1 else {}), **avg}
                     results.append(entry)
@@ -328,7 +354,11 @@ def print_matrix_summary(results):
     print("-" * 180)
     latency_hdr = " | ".join([f"{'P-P50':<6} {'P-P90':<6} {'P-P99':<6}",
                                f"{'G-P50':<6} {'G-P90':<6} {'G-P99':<6}"])
-    header = f"{'Mode':<15} | {'Th':<3} | {'Bch':<3} | {'Val(MB)':<7} | {'RPC':<3} | {'Ops':<5} | {'Buf':<3} | {'A-Th':<5} | {'A-Wk':<4} | {'A-QD':<5} | {'PUT-MB/s':<10} | {'GET-MB/s':<10} | {latency_hdr}"
+    header = (
+        f"{'Mode':<15} | {'Th':<3} | {'Bch':<3} | {'Val(MB)':<7} | {'RPC':<3} | "
+        f"{'Ops':<5} | {'Buf':<3} | {'A-Th':<5} | {'A-Wk':<4} | {'A-QD':<5} | "
+        f"{'R-Th':<5} | {'R-Wk':<4} | {'PUT-MB/s':<10} | {'GET-MB/s':<10} | {latency_hdr}"
+    )
     print(header)
     print("-" * 180)
     for r in results:
@@ -337,8 +367,11 @@ def print_matrix_summary(results):
         a_th = str(r.get('async_threshold', '-'))
         a_wk = str(r.get('async_workers', '-'))
         a_qd = str(r.get('async_queue_depth', '-'))
+        r_th = str(r.get('remote_async_threshold', '-'))
+        r_wk = str(r.get('remote_async_workers', '-'))
         print(f"{r['mode']:<15} | {r['threads']:<3} | {r.get('batch', 1):<3} | {r['value_size']/1024/1024:<7.1f} | {r['rpc_threads']:<3} | {r['ops']:<5} | {r['ram_buffer_size_gb']:<3} | "
-              f"{a_th:<5} | {a_wk:<4} | {a_qd:<5} | {r['put_throughput']:<10.1f} | {r['get_throughput']:<10.1f} | "
+              f"{a_th:<5} | {a_wk:<4} | {a_qd:<5} | {r_th:<5} | {r_wk:<4} | "
+              f"{r['put_throughput']:<10.1f} | {r['get_throughput']:<10.1f} | "
               f"{put_lat} | {get_lat}")
     print("=" * 180 + "\n")
 

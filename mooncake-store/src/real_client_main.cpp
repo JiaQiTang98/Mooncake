@@ -36,6 +36,15 @@ DEFINE_uint64(local_copy_async_worker_num, 1,
               "Worker number for async local memcpy executor (P2P)");
 DEFINE_uint64(local_copy_async_queue_depth, 1024,
               "Queue depth for async local memcpy executor (P2P)");
+DEFINE_string(p2p_local_transfer_mode, "te",
+              "Local transfer mode for P2P local Get/Put path: memcpy|te");
+DEFINE_uint64(
+    remote_batch_async_key_threshold, 2,
+    "Batch key count threshold to enable async remote BatchGet/BatchPut fan-out (P2P)");
+DEFINE_uint64(
+    remote_batch_async_worker_num, 0,
+    "Max in-flight worker number for async remote BatchGet/BatchPut fan-out (P2P). "
+    "Set to 0 to keep synchronous behavior.");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -99,7 +108,10 @@ int main(int argc, char* argv[]) {
                 FLAGS_route_cache_ttl_ms,
                 static_cast<size_t>(FLAGS_local_copy_async_key_threshold),
                 static_cast<size_t>(FLAGS_local_copy_async_worker_num),
-                static_cast<size_t>(FLAGS_local_copy_async_queue_depth));
+                static_cast<size_t>(FLAGS_local_copy_async_queue_depth),
+                FLAGS_p2p_local_transfer_mode,
+                static_cast<size_t>(FLAGS_remote_batch_async_key_threshold),
+                static_cast<size_t>(FLAGS_remote_batch_async_worker_num));
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)

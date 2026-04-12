@@ -2,11 +2,12 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <future>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <utility>
 
 #include "client_service.h"
 #include "data_manager.h"
@@ -264,50 +265,75 @@ class P2PClientService final : public ClientService {
 
     class AsyncMemcpyExecutor {
        public:
+        template <typename ResultType>
         struct BatchState {
-            std::vector<ErrorCode> results;
+            std::vector<ResultType> results;
             std::atomic<size_t> remaining{0};
             std::mutex done_mutex;
             std::condition_variable done_cv;
             bool done = false;
         };
 
+        template <typename ResultType>
         struct BatchHandle {
-            std::shared_ptr<BatchState> state;
-            std::vector<ErrorCode> Wait() const;
+            std::shared_ptr<BatchState<ResultType>> state;
+
+            std::vector<ResultType> Wait() const {
+                if (!state) {
+                    return {};
+                }
+                if (state->remaining.load(std::memory_order_acquire) > 0) {
+                    std::unique_lock<std::mutex> lock(state->done_mutex);
+                    auto state_ptr = state;
+                    state->done_cv.wait(lock,
+                                        [state_ptr] { return state_ptr->done; });
+                }
+                return state->results;
+            }
         };
 
         AsyncMemcpyExecutor(size_t worker_num, size_t max_queue_size);
         ~AsyncMemcpyExecutor();
 
-        std::future<ErrorCode> Submit(LocalCopyPlan plan);
-
-        // Submit batch copy plans and return one completion handle for the
-        // entire batch, avoiding per-key future allocation overhead.
-        BatchHandle SubmitBatch(std::vector<LocalCopyPlan> plans);
+        // Generic batched submit/wait path used by both local memcpy and
+        // remote BatchGet/BatchPut fan-out.
+        template <typename ResultType, typename TaskFn, typename ErrorFn>
+        BatchHandle<ResultType> SubmitBatchTasks(
+            const std::vector<size_t>& indices, TaskFn&& task_fn,
+            ErrorFn&& on_error);
 
         void Shutdown();
 
        private:
-        struct CopyTask {
-            LocalCopyPlan plan;
-            std::promise<ErrorCode> result;
-            std::shared_ptr<BatchState> batch_state;
-            size_t batch_index = 0;
-            bool is_batch = false;
+        struct QueueTask {
+            std::function<void()> run;
+            std::function<void()> cancel;
         };
 
-        // Long-running worker loop consuming submitted local copy tasks.
+        // Long-running worker loop consuming submitted async tasks.
         void WorkerMain();
-        static void FinishBatchTask(const std::shared_ptr<BatchState>& state,
-                                    size_t batch_index, ErrorCode result);
+        template <typename ResultType>
+        static void FinishBatchTask(
+            const std::shared_ptr<BatchState<ResultType>>& state,
+            size_t batch_index, ResultType result) {
+            if (!state || batch_index >= state->results.size()) {
+                return;
+            }
+            state->results[batch_index] = std::move(result);
+            if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) ==
+                1) {
+                std::lock_guard<std::mutex> lock(state->done_mutex);
+                state->done = true;
+                state->done_cv.notify_one();
+            }
+        }
 
         size_t max_queue_size_ = 0;
         bool shutting_down_ = false;
         std::mutex mutex_;
         std::condition_variable queue_not_empty_cv_;
         std::condition_variable queue_not_full_cv_;
-        std::queue<CopyTask> tasks_;
+        std::queue<QueueTask> tasks_;
         std::vector<std::thread> workers_;
     };
     friend class AsyncMemcpyExecutor;
@@ -317,13 +343,15 @@ class P2PClientService final : public ClientService {
         const std::vector<Slice>& slices) const;
     // Execute one local copy plan synchronously in the current thread.
     static ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan);
-    // Unified local copy entry: validate, choose sync/async path by batch key
-    // count, then return bytes.
-    tl::expected<size_t, ErrorCode> RunLocalCopy(const std::string& key,
-                                                 const AllocationHandle& handle,
-                                                 const std::vector<Slice>& slices,
-                                                 size_t batch_key_count = 1);
+    // Single-key synchronous memcpy fast path (no LocalCopyPlan allocation).
+    static tl::expected<size_t, ErrorCode> CopyLocalBufferSync(
+        const std::string& key, const AllocationHandle& handle,
+        const std::vector<Slice>& slices);
     bool ShouldUseAsyncLocalCopy(size_t batch_key_count) const;
+    // Remote async fan-out in BatchGet/BatchPut is controlled by dedicated
+    // remote-batch knobs and defaults to disabled for compatibility.
+    bool ShouldUseAsyncBatchRpc(size_t batch_key_count) const;
+    bool UseLocalTeTransfer() const;
 
     /**
      * @brief Get data from a remote node via a list of proxy descriptors.
@@ -368,7 +396,12 @@ class P2PClientService final : public ClientService {
     size_t local_copy_async_key_threshold_ = 2;
     size_t local_copy_async_worker_num_ = 1;
     size_t local_copy_async_queue_depth_ = 1024;
-    std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
+    std::unique_ptr<AsyncMemcpyExecutor> async_local_copy_executor_;
+    size_t remote_batch_async_key_threshold_ = 2;
+    size_t remote_batch_async_worker_num_ = 0;
+    std::unique_ptr<AsyncMemcpyExecutor> async_remote_batch_executor_;
+    P2PClientConfig::LocalTransferMode local_transfer_mode_ =
+        P2PClientConfig::LocalTransferMode::TE;
 };
 
 }  // namespace mooncake

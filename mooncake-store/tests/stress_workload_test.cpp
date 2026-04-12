@@ -50,6 +50,13 @@ DEFINE_uint64(async_copy_worker_num, 4,
               "Number of worker threads for async local copy (P2P)");
 DEFINE_uint64(async_copy_queue_depth, 1024,
               "Queue depth for async local copy (P2P)");
+DEFINE_uint64(
+    remote_async_threshold, 2,
+    "Threshold for enabling async remote batch fan-out (P2P)");
+DEFINE_uint64(
+    remote_async_worker_num, 0,
+    "Worker count for async remote batch fan-out (P2P). "
+    "Set to 0 to keep synchronous behavior");
 
 namespace mooncake {
 namespace benchmark {
@@ -155,7 +162,9 @@ bool initialize_client() {
             /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
             /*route_cache_ttl_ms=*/5 * 60 * 1000,
             FLAGS_async_copy_threshold, FLAGS_async_copy_worker_num,
-            FLAGS_async_copy_queue_depth);
+            FLAGS_async_copy_queue_depth,
+            /*local_transfer_mode=*/"te", FLAGS_remote_async_threshold,
+            FLAGS_remote_async_worker_num);
         client_opt = ClientService::Create(config);
     } else {
         auto config = ClientConfigBuilder::build_centralized_real_client(
@@ -176,14 +185,11 @@ bool initialize_client() {
     // Pre-allocate the worker buffer pool with exact sizing, bypassing the
     // slab allocator (SimpleAllocator/CacheLib) to avoid fragmentation.
     // Each thread gets: 1 write_buffer + num_read_slots read slots.
-    // For P2P, each key in a batch needs its own destination slot so that
-    // concurrent async copy workers never write to the same buffer.
-    // batch_size slots is the exact requirement: one per key per batch.
-    // Centralization is synchronous, so 1 slot is sufficient.
+    // Both P2P and Centralization BatchGet submit all transfers in parallel,
+    // so each key in a batch needs its own destination slot to avoid concurrent
+    // RDMA/memcpy writes targeting the same buffer region.
     size_t per_thread_read_slots =
-        (FLAGS_client_type == "P2P")
-            ? static_cast<size_t>(std::max(1, FLAGS_batch_size))
-            : 1UL;
+        static_cast<size_t>(std::max(1, FLAGS_batch_size));
     g_per_thread_buffer_stride =
         static_cast<size_t>(FLAGS_value_size) * (1 + per_thread_read_slots);
     size_t total_buffer_size = FLAGS_num_threads * g_per_thread_buffer_stride;
@@ -236,8 +242,7 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
     // pool. The stride is computed once in initialize_client() so all threads
     // use the same formula and regions never overlap.
     // Layout per thread: [write_buffer | read_pool_slot_0 | ... | slot_N-1]
-    int num_read_slots =
-        (FLAGS_client_type == "P2P") ? std::max(1, FLAGS_batch_size) : 1;
+    int num_read_slots = std::max(1, FLAGS_batch_size);
     char* thread_base =
         static_cast<char*>(g_worker_buffer_base) +
         static_cast<size_t>(thread_id) * g_per_thread_buffer_stride;

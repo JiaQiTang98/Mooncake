@@ -5,6 +5,9 @@
 #include <map>
 #include <memory>
 #include <cstdint>
+#include <algorithm>
+#include <cctype>
+#include <stdexcept>
 
 #include <glog/logging.h>
 #include <json/json.h>
@@ -116,6 +119,11 @@ struct CentralizedClientConfig : RealClientConfigBase {
  * Inherits all common real client fields and adds P2P-specific options.
  */
 struct P2PClientConfig : RealClientConfigBase {
+    enum class LocalTransferMode {
+        MEMCPY = 0,
+        TE = 1,
+    };
+
     // Port for P2P RPC service.
     uint16_t client_rpc_port = 12345;
 
@@ -142,6 +150,19 @@ struct P2PClientConfig : RealClientConfigBase {
     size_t local_copy_async_key_threshold = 2;
     size_t local_copy_async_worker_num = 4;
     size_t local_copy_async_queue_depth = 1024;
+
+    // Async remote batch RPC configuration for P2P BatchGet/BatchPut fallback
+    // path.
+    // If worker_num is 0, remote batch path keeps synchronous behavior.
+    // Otherwise, when batch key count >= remote_batch_async_key_threshold,
+    // remote keys are processed with bounded in-flight fan-out.
+    size_t remote_batch_async_key_threshold = 2;
+    size_t remote_batch_async_worker_num = 0;
+
+    // Local transfer mode for P2P local Get/Put path.
+    // - MEMCPY: copy through local CPU memory path
+    // - TE: transfer through local TransferEngine path
+    LocalTransferMode local_transfer_mode = LocalTransferMode::TE;
 };
 
 // ============================================================================
@@ -202,6 +223,9 @@ class ClientConfigBuilder {
         size_t local_copy_async_key_threshold = 2,
         size_t local_copy_async_worker_num = 1,
         size_t local_copy_async_queue_depth = 1024,
+        const std::string& local_transfer_mode = "te",
+        size_t remote_batch_async_key_threshold = 2,
+        size_t remote_batch_async_worker_num = 0,
         const std::map<std::string, std::string>& labels = {}) {
         P2PClientConfig config;
         fill_real_client_config_base(
@@ -216,6 +240,11 @@ class ClientConfigBuilder {
         config.local_copy_async_key_threshold = local_copy_async_key_threshold;
         config.local_copy_async_worker_num = local_copy_async_worker_num;
         config.local_copy_async_queue_depth = local_copy_async_queue_depth;
+        config.local_transfer_mode =
+            parse_p2p_local_transfer_mode(local_transfer_mode);
+        config.remote_batch_async_key_threshold =
+            remote_batch_async_key_threshold;
+        config.remote_batch_async_worker_num = remote_batch_async_worker_num;
 
         Json::Value tiered_config;
         std::string actual_json = tiered_backend_config_json;
@@ -292,6 +321,22 @@ class ClientConfigBuilder {
         config.transfer_engine = transfer_engine;
         config.ipc_socket_path = ipc_socket_path;
         config.labels = labels;
+    }
+
+    static P2PClientConfig::LocalTransferMode parse_p2p_local_transfer_mode(
+        std::string mode) {
+        std::transform(mode.begin(), mode.end(), mode.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        if (mode == "memcpy") {
+            return P2PClientConfig::LocalTransferMode::MEMCPY;
+        }
+        if (mode == "te") {
+            return P2PClientConfig::LocalTransferMode::TE;
+        }
+        throw std::runtime_error(
+            "Invalid p2p local transfer mode. Expected 'memcpy' or 'te'.");
     }
 };
 

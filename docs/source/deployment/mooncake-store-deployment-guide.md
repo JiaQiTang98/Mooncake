@@ -64,6 +64,14 @@ mooncake_master \
   - `--local_copy_async_worker_num` (uint64, default `1`): Worker count for local async memcpy executor. Set to `0` to disable async local memcpy.
   - `--local_copy_async_queue_depth` (uint64, default `1024`): Task queue depth for local async memcpy executor.
 
+- Local transfer mode tuning (P2P local read/write path)
+  - `--p2p_local_transfer_mode` (str, default `te`): Select local transfer path in P2P mode. Supported values are `memcpy` and `te`.
+  - Note: `te` mode requires source/destination buffers to be registered with TransferEngine (for example via `RegisterLocalMemory` in the client path).
+
+- Remote batch async tuning (P2P remote BatchGet/BatchPut path)
+  - `--remote_batch_async_key_threshold` (uint64, default `2`): Enable remote batch fan-out when batch key count is greater than or equal to this value.
+  - `--remote_batch_async_worker_num` (uint64, default `0`): Max in-flight remote batch tasks. Set to `0` to keep the historical synchronous behavior (default).
+
 Example (P2P real client with async local memcpy enabled):
 
 ```bash
@@ -76,7 +84,8 @@ mooncake_client \
   --rpc_thread_num=16 \
   --local_copy_async_key_threshold=4 \
   --local_copy_async_worker_num=2 \
-  --local_copy_async_queue_depth=2048
+  --local_copy_async_queue_depth=2048 \
+  --p2p_local_transfer_mode=te
 ```
 
 **Tips:**
